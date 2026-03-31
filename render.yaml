@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: summas-bet
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /healthz
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: summas-bet-db
+          property: connectionString
+      - key: FOOTBALL_DATA_API_KEY
+        sync: false
+      - key: SITE_ACCESS_USERNAME
+        sync: false
+      - key: SITE_ACCESS_PASSWORD
+        sync: false
+      - key: FOOTBALLDATA_TARGET_FIXTURE_COUNT
+        value: "40"
+      - key: FOOTBALLDATA_COMPETITION_SWEEP_LIMIT
+        value: "8"
+
+databases:
+  - name: summas-bet-db
+    databaseName: summas_bet
