@@ -419,41 +419,41 @@ def _collect_public_web_bundle(db: Session, match_date: Optional[calendar_date] 
             day_end = day_start + timedelta(days=1)
 
             try:
-                home_team = _get_or_create_team_for_public_web(db, home_name, league_name)
-                away_team = _get_or_create_team_for_public_web(db, away_name, league_name)
+                with db.begin_nested():
+                    home_team = _get_or_create_team_for_public_web(db, home_name, league_name)
+                    away_team = _get_or_create_team_for_public_web(db, away_name, league_name)
 
-                existing = (
-                    db.query(Fixture)
-                    .filter(
-                        Fixture.home_id == home_team.id,
-                        Fixture.away_id == away_team.id,
-                        Fixture.date >= day_start,
-                        Fixture.date < day_end,
+                    existing = (
+                        db.query(Fixture)
+                        .filter(
+                            Fixture.home_id == home_team.id,
+                            Fixture.away_id == away_team.id,
+                            Fixture.date >= day_start,
+                            Fixture.date < day_end,
+                        )
+                        .first()
                     )
-                    .first()
-                )
-                if existing:
-                    existing.date = kickoff_dt
-                    existing.status = normalize_status(candidate.match_status, is_finished=False)
-                    if not existing.league or existing.league == "Unknown":
-                        existing.league = league_name
-                    db.flush()
-                    fixture_ids.append(existing.id)
-                    continue
+                    if existing:
+                        existing.date = kickoff_dt
+                        existing.status = normalize_status(candidate.match_status, is_finished=False)
+                        if not existing.league or existing.league == "Unknown":
+                            existing.league = league_name
+                        db.flush()
+                        fixture_ids.append(existing.id)
+                        continue
 
-                fixture = Fixture(
-                    date=kickoff_dt,
-                    home_id=home_team.id,
-                    away_id=away_team.id,
-                    league=league_name,
-                    status=normalize_status(candidate.match_status, is_finished=False),
-                )
-                db.add(fixture)
-                db.flush()
-                if fixture.id is not None:
-                    fixture_ids.append(fixture.id)
+                    fixture = Fixture(
+                        date=kickoff_dt,
+                        home_id=home_team.id,
+                        away_id=away_team.id,
+                        league=league_name,
+                        status=normalize_status(candidate.match_status, is_finished=False),
+                    )
+                    db.add(fixture)
+                    db.flush()
+                    if fixture.id is not None:
+                        fixture_ids.append(fixture.id)
             except Exception as exc:
-                db.rollback()
                 failures[adapter.source_name] = str(exc)
                 logger.warning("public_web candidate ingest failed (%s): %s", adapter.source_name, exc)
 
@@ -742,6 +742,11 @@ def _collect_fixture_bundle(source: str, db: Session, match_date: Optional[calen
                 logger.exception("public_web collection crashed in hybrid mode; continuing with API sources")
                 public_web_bundle = _public_web_failure_bundle(match_date, str(exc))
             bundles.append(public_web_bundle)
+            if PUBLIC_WEB_REQUIRED_SUCCESS and public_web_bundle.get("source_status", {}).get("public_web", {}).get("failed"):
+                raise HTTPException(
+                    status_code=503,
+                    detail=public_web_bundle.get("note") or "public_web collection failed",
+                )
         bundle = _combine_collection_bundles(db, *bundles)
         bundle["source"] = "hybrid"
         notes = [football_bundle.get("note")]
