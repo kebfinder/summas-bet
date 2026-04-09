@@ -352,44 +352,116 @@ def _store_public_web_cached_bundle(cache_key: str, bundle: dict) -> None:
         _PUBLIC_WEB_BUNDLE_CACHE[cache_key] = (time.time(), copy.deepcopy(bundle))
 
 
-def _get_or_create_team_for_public_web(db: Session, name: str, league: Optional[str]) -> Team:
-    normalized_name = normalize_team_name(name)
-    normalized_identity = normalize_team_identity(normalized_name)
-    team = db.query(Team).filter(Team.name == normalized_name).first()
-    if team:
-        if league and (not team.league or team.league == "Unknown"):
-            team.league = league
-        return team
+def _get_or_create_team_for_public_web(
+    db: Session,
+    name: str,
+    league: Optional[str],
+    resolver: Optional["_PublicWebTeamResolver"] = None,
+) -> Team:
+    active_resolver = resolver or _PublicWebTeamResolver(db)
+    return active_resolver.resolve(name, league)
 
-    def _match_by_identity(candidates: list[Team]) -> Optional[Team]:
-        if not normalized_identity:
-            return None
-        for candidate in candidates:
-            if normalize_team_identity(candidate.name) == normalized_identity:
-                return candidate
+
+def _normalize_league_key(league: Optional[str]) -> str:
+    normalized = normalize_team_name(league)
+    return normalized or "Unknown"
+
+
+class _PublicWebTeamResolver:
+    def __init__(self, db: Session):
+        self.db = db
+        self._teams = db.query(Team).all()
+        self._by_exact_league: dict[tuple[str, str], list[Team]] = {}
+        self._by_identity_league: dict[tuple[str, str], list[Team]] = {}
+        self._build_indexes()
+
+    def _build_indexes(self) -> None:
+        for team in self._teams:
+            normalized_name = normalize_team_name(team.name)
+            if not normalized_name:
+                continue
+            league_key = _normalize_league_key(team.league)
+            self._by_exact_league.setdefault((league_key, normalized_name), []).append(team)
+            normalized_identity = normalize_team_identity(normalized_name)
+            if normalized_identity:
+                self._by_identity_league.setdefault((league_key, normalized_identity), []).append(team)
+
+    @staticmethod
+    def _pick_unique(candidates: list[Team]) -> Optional[Team]:
+        unique = {candidate.id: candidate for candidate in candidates if candidate.id is not None}
+        if len(unique) == 1:
+            return next(iter(unique.values()))
         return None
 
-    scoped_candidates = db.query(Team).filter(Team.league == league).all() if league else []
-    identity_match = _match_by_identity(scoped_candidates)
-    if not identity_match:
-        identity_match = _match_by_identity(db.query(Team).all())
-    if identity_match:
-        if league and (not identity_match.league or identity_match.league == "Unknown"):
-            identity_match.league = league
-        return identity_match
+    def _candidates_for(self, mapping: dict[tuple[str, str], list[Team]], league_key: str, key: str) -> list[Team]:
+        return list(mapping.get((league_key, key), []))
 
-    team = Team(
-        name=normalized_name,
-        league=league or "Unknown",
-        country=None,
-        avg_scored=1.25,
-        avg_conceded=1.25,
-        attack_strength=1.0,
-        defense_strength=1.0,
-    )
-    db.add(team)
-    db.flush()
-    return team
+    def _reassign_if_unknown_league(self, team: Team, league: Optional[str]) -> Team:
+        if league and (not team.league or team.league == "Unknown"):
+            previous_league_key = _normalize_league_key(team.league)
+            updated_league_key = _normalize_league_key(league)
+            normalized_name = normalize_team_name(team.name)
+            normalized_identity = normalize_team_identity(normalized_name)
+            self._by_exact_league[(previous_league_key, normalized_name)] = [
+                candidate
+                for candidate in self._by_exact_league.get((previous_league_key, normalized_name), [])
+                if candidate.id != team.id
+            ]
+            if normalized_identity:
+                self._by_identity_league[(previous_league_key, normalized_identity)] = [
+                    candidate
+                    for candidate in self._by_identity_league.get((previous_league_key, normalized_identity), [])
+                    if candidate.id != team.id
+                ]
+            team.league = league
+            self._by_exact_league.setdefault((updated_league_key, normalized_name), []).append(team)
+            if normalized_identity:
+                self._by_identity_league.setdefault((updated_league_key, normalized_identity), []).append(team)
+        return team
+
+    def resolve(self, name: str, league: Optional[str]) -> Team:
+        normalized_name = normalize_team_name(name)
+        normalized_identity = normalize_team_identity(normalized_name)
+        league_key = _normalize_league_key(league)
+        unknown_key = "Unknown"
+
+        exact_league_match = self._pick_unique(self._candidates_for(self._by_exact_league, league_key, normalized_name))
+        if exact_league_match:
+            return exact_league_match
+
+        exact_unknown_match = self._pick_unique(self._candidates_for(self._by_exact_league, unknown_key, normalized_name))
+        if exact_unknown_match:
+            return self._reassign_if_unknown_league(exact_unknown_match, league)
+
+        if normalized_identity:
+            identity_league_match = self._pick_unique(
+                self._candidates_for(self._by_identity_league, league_key, normalized_identity)
+            )
+            if identity_league_match:
+                return identity_league_match
+
+            identity_unknown_match = self._pick_unique(
+                self._candidates_for(self._by_identity_league, unknown_key, normalized_identity)
+            )
+            if identity_unknown_match:
+                return self._reassign_if_unknown_league(identity_unknown_match, league)
+
+        team = Team(
+            name=normalized_name,
+            league=league or "Unknown",
+            country=None,
+            avg_scored=1.25,
+            avg_conceded=1.25,
+            attack_strength=1.0,
+            defense_strength=1.0,
+        )
+        self.db.add(team)
+        self.db.flush()
+        self._teams.append(team)
+        self._by_exact_league.setdefault((_normalize_league_key(team.league), normalized_name), []).append(team)
+        if normalized_identity:
+            self._by_identity_league.setdefault((_normalize_league_key(team.league), normalized_identity), []).append(team)
+        return team
 
 
 def _collect_public_web_bundle(db: Session, match_date: Optional[calendar_date] = None, days_ahead: int = 0):
@@ -517,6 +589,7 @@ def _collect_public_web_bundle(db: Session, match_date: Optional[calendar_date] 
         fixture_source_index: dict[int, str] = {}
         kickoff_fallback_fixtures: list[int] = []
 
+        team_resolver = _PublicWebTeamResolver(db)
         for adapter in adapters:
             adapter_status = {
                 "enabled": True,
@@ -608,8 +681,8 @@ def _collect_public_web_bundle(db: Session, match_date: Optional[calendar_date] 
 
                 try:
                     with db.begin_nested():
-                        home_team = _get_or_create_team_for_public_web(db, home_name, league_name)
-                        away_team = _get_or_create_team_for_public_web(db, away_name, league_name)
+                        home_team = _get_or_create_team_for_public_web(db, home_name, league_name, team_resolver)
+                        away_team = _get_or_create_team_for_public_web(db, away_name, league_name, team_resolver)
 
                         existing = (
                             db.query(Fixture)
