@@ -1,6 +1,7 @@
 from datetime import date as calendar_date
 from pathlib import Path
 import sys
+import time
 
 from fastapi import HTTPException
 from sqlalchemy import create_engine
@@ -12,6 +13,7 @@ import main
 from database.database import Base
 from database.models import Fixture
 from utils.browser_assist import BrowserFixtureCandidate
+from utils.browser_sources import get_default_browser_adapters, get_public_web_support_matrix
 
 
 def _reset_public_web_state():
@@ -194,6 +196,7 @@ def test_public_web_bundle_exposes_per_adapter_diagnostics(monkeypatch):
     assert adapter["raw_rows_found"] == 1
     assert adapter["parsed_fixtures"] == 1
     assert adapter["persisted_fixtures"] == 1
+    assert bundle["source_status"]["public_web"]["supported_competitions"]
 
 
 def test_public_web_collection_uses_short_lived_cache(monkeypatch):
@@ -235,3 +238,103 @@ def test_public_web_collection_uses_short_lived_cache(monkeypatch):
     assert calls["count"] == 1
     assert first["source_status"]["public_web"]["cache_hit"] is False
     assert second["source_status"]["public_web"]["cache_hit"] is True
+
+
+def test_public_web_adapters_expand_beyond_conmebol():
+    names = [adapter.source_name for adapter in get_default_browser_adapters(())]
+    assert names == [
+        "uefa_champions_league",
+        "uefa_europa_league",
+        "uefa_conference_league",
+        "conmebol_libertadores",
+        "conmebol_sudamericana",
+    ]
+
+
+def test_public_web_support_matrix_exposes_phased_explicit_competition_plan():
+    matrix = get_public_web_support_matrix(())
+    assert len(matrix) == 28
+    assert matrix[0]["competition_name"] == "Premier League"
+    assert matrix[0]["priority"] == 1
+    assert matrix[9]["competition_name"] == "Copa Sudamericana"
+    assert matrix[9]["implemented"] is True
+    assert matrix[10]["competition_name"] == "CAF Champions League"
+    assert matrix[10]["implemented"] is False
+    assert matrix[10]["eligible_for_run"] is False
+
+
+def test_public_web_team_identity_matching_reuses_existing_team(monkeypatch):
+    _reset_public_web_state()
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+    Base.metadata.create_all(bind=engine)
+    db = SessionLocal()
+
+    legacy = main.Team(name="Atletico Nacional", league="Copa Libertadores")
+    db.add(legacy)
+    db.commit()
+
+    resolved = main._get_or_create_team_for_public_web(db, "Atlético Nacional", "Copa Libertadores")
+    db.commit()
+    teams = db.query(main.Team).all()
+    db.close()
+
+    assert resolved.id == legacy.id
+    assert len(teams) == 1
+
+
+def test_public_web_required_success_fails_when_adapter_is_cooling_down(monkeypatch):
+    _reset_public_web_state()
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+    Base.metadata.create_all(bind=engine)
+    db = SessionLocal()
+
+    class _Adapter:
+        source_name = "test_adapter_cooldown"
+
+        def discover(self, requested_date, plan):
+            return []
+
+    monkeypatch.setattr(main, "PUBLIC_WEB_ENABLED", True)
+    monkeypatch.setattr(main, "PUBLIC_WEB_REQUIRED_SUCCESS", True)
+    monkeypatch.setattr(main, "PUBLIC_WEB_ALLOWED_SOURCES", [])
+    monkeypatch.setattr(
+        "utils.browser_sources.get_default_browser_adapters",
+        lambda allowed_sources: [_Adapter()],
+    )
+    monkeypatch.setitem(
+        main._PUBLIC_WEB_ADAPTER_COOLDOWNS,
+        "test_adapter_cooldown",
+        time.time() + 60,
+    )
+
+    try:
+        main._collect_fixture_bundle("public_web", db=db, match_date=calendar_date(2026, 4, 9))
+    except HTTPException as exc:
+        assert exc.status_code == 503
+        assert "public_web" in exc.detail
+        assert "cooldown" in exc.detail
+    else:
+        raise AssertionError("Expected public_web source to fail closed during adapter cooldown")
+    finally:
+        db.close()
+
+
+def test_public_web_reports_unknown_allowlist_sources(monkeypatch):
+    _reset_public_web_state()
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+    Base.metadata.create_all(bind=engine)
+    db = SessionLocal()
+
+    monkeypatch.setattr(main, "PUBLIC_WEB_ENABLED", True)
+    monkeypatch.setattr(main, "PUBLIC_WEB_ALLOWED_SOURCES", ["not_real_adapter"])
+
+    bundle = main._collect_public_web_bundle(db, match_date=calendar_date(2026, 4, 9))
+    status = bundle["source_status"]["public_web"]
+    db.close()
+
+    assert status["failed"] is True
+    assert "not_real_adapter" in status["unsupported_allowed_sources"]
+    assert "Unknown allowlist sources" in (status["failure_reason"] or "")

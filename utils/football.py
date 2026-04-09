@@ -1,12 +1,37 @@
 from __future__ import annotations
 
 from datetime import date as calendar_date, datetime, timedelta
+import re
+import unicodedata
 
 
 def normalize_team_name(name: str | None) -> str:
     if not name:
         return ""
     return " ".join(str(name).split())
+
+
+_TEAM_STOPWORDS = {
+    "fc",
+    "cf",
+    "sc",
+    "ac",
+    "afc",
+    "club",
+    "de",
+    "the",
+}
+
+
+def normalize_team_identity(name: str | None) -> str:
+    normalized = normalize_team_name(name).lower()
+    if not normalized:
+        return ""
+    folded = unicodedata.normalize("NFKD", normalized).encode("ascii", "ignore").decode("ascii")
+    folded = re.sub(r"\(.*?\)", " ", folded)
+    folded = re.sub(r"[^a-z0-9\s]", " ", folded)
+    tokens = [token for token in folded.split() if token and token not in _TEAM_STOPWORDS]
+    return " ".join(tokens)
 
 
 def clamp(value: float, lower: float, upper: float) -> float:
