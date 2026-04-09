@@ -1,9 +1,11 @@
 import base64
+import json
 import logging
 import os
 import sys
 from datetime import date as calendar_date, datetime, timedelta
 from html import escape
+from pathlib import Path
 from secrets import compare_digest
 from typing import List, Optional
 
@@ -58,6 +60,7 @@ from schemas import (
     UpdateStatsResponse,
 )
 from services.stats_service import refresh_team_statistics
+from services.fixture_enrichment import enrich_fixtures, summarize_enrichment
 from utils.competitions import is_competition_admitted, resolve_competition
 from utils.football import (
     clamp,
@@ -74,6 +77,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 APP_VERSION = "1.6.4"
+ARTIFACTS_DIR = Path("artifacts")
 
 SITE_ACCESS_USERNAME = os.getenv("SITE_ACCESS_USERNAME", "").strip()
 SITE_ACCESS_PASSWORD = os.getenv("SITE_ACCESS_PASSWORD", "").strip()
@@ -439,6 +443,7 @@ def _collect_fixture_bundle(source: str, db: Session, match_date: Optional[calen
     bundle["fixture_ids"] = fixture_ids
     bundle["unique_fixtures"] = unique_count
     bundle["duplicates_removed"] = max(int(bundle.get("raw_fixtures", 0)) - unique_count, 0)
+    bundle["fixture_enrichment"] = enrich_fixtures(db, fixtures)
     return bundle
 
 
@@ -455,6 +460,7 @@ def _app_status_payload():
             "/healthz",
             "/dates/available",
             "/day-summary",
+            "/debug/enrichment",
             "/status",
             "/scrape/today",
             "/fixtures",
@@ -630,6 +636,15 @@ def _serialize_fixture(fixture: Fixture):
         "date": str(fixture.date),
         "status": fixture.status,
     }
+
+
+def _write_enrichment_debug_report(report: dict, requested_date: calendar_date) -> str:
+    output_dir = ARTIFACTS_DIR / "enrichment_debug"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    output_path = output_dir / f"enrichment_debug_{requested_date.isoformat()}_{timestamp}.json"
+    output_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    return output_path.as_posix()
 
 
 def _competition_flags(league_name: Optional[str]) -> dict:
@@ -2062,6 +2077,36 @@ def get_day_summary(
     db: Session = Depends(get_db),
 ):
     return _day_collection_summary(db, match_date, source="stored", min_edge=min_edge, limit=limit)
+
+
+@app.get("/debug/enrichment")
+def debug_fixture_enrichment(
+    source: str = Query("hybrid", description="Source: hybrid, openligadb or footballdata"),
+    match_date: Optional[calendar_date] = Query(None, alias="date", description="Day in YYYY-MM-DD format; defaults to today"),
+    sample_limit: int = Query(200, ge=1, le=1000, description="Maximum enriched fixtures to include in the response"),
+    db: Session = Depends(get_db),
+):
+    requested_date = _resolve_requested_date(match_date)
+    collection_bundle = _collect_fixture_bundle(source, db, match_date=requested_date)
+    enriched_map = collection_bundle.get("fixture_enrichment", {})
+    enriched_rows = list(enriched_map.values())[:sample_limit]
+    summary = summarize_enrichment({row.get("fixture_id"): row for row in enriched_rows if row.get("fixture_id") is not None})
+
+    report = {
+        "mode": "read_only_debug",
+        "requested_date": requested_date.isoformat(),
+        "source": source,
+        "collection": {
+            "raw_fixtures": int(collection_bundle.get("raw_fixtures", 0)),
+            "unique_fixtures": int(collection_bundle.get("unique_fixtures", 0)),
+            "duplicates_removed": int(collection_bundle.get("duplicates_removed", 0)),
+            "source_breakdown": dict(collection_bundle.get("source_breakdown", {})),
+        },
+        "summary": summary,
+        "fixtures": enriched_rows,
+    }
+    report["artifact_path"] = _write_enrichment_debug_report(report, requested_date)
+    return report
 
 
 @app.get("/scrape/today", response_model=ScrapeFixturesResponse)
