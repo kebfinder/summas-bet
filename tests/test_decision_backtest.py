@@ -4,6 +4,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from services.decision_backtest import resolve_market_outcome, _summarize
+from services.preview_calibration import CalibrationConfig
 
 
 def test_resolve_market_outcome_supported_markets():
@@ -46,3 +47,9 @@ def test_summarize_empty_rows_safe():
     summary = _summarize([], total_fixtures_evaluated=0, skipped_fixtures=0)
     assert summary["total_predictions_generated"] == 0
     assert summary["hit_rate_overall"] == 0.0
+
+
+def test_calibration_config_defaults_available():
+    config = CalibrationConfig(enabled=True)
+    assert config.enabled is True
+    assert config.min_market_samples > 0
