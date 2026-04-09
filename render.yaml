@@ -20,6 +20,10 @@ services:
         value: "40"
       - key: FOOTBALLDATA_COMPETITION_SWEEP_LIMIT
         value: "8"
+      - key: PUBLIC_WEB_ENABLED
+        value: "true"
+      - key: PUBLIC_WEB_REQUIRED_SUCCESS
+        value: "false"
 
 databases:
   - name: summas-bet-db
