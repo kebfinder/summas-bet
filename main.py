@@ -16,10 +16,18 @@ from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.orm import Session
 
 from config import (
+    CALIBRATED_ENGINE_EVIDENCE_LOOKBACK_DAYS,
+    CALIBRATED_ENGINE_LOW_EVIDENCE_PENALTY,
+    CALIBRATED_ENGINE_MIN_CONFIDENCE,
+    CALIBRATED_ENGINE_MIN_MARKET_HIT_RATE,
+    CALIBRATED_ENGINE_MIN_MARKET_SAMPLES,
+    CALIBRATED_ENGINE_SUPPRESS_UNDERPERFORMING_MARKETS,
+    CALIBRATED_ENGINE_UNDERPERFORMANCE_PENALTY_SCALE,
     FOOTBALLDATA_COMPETITION_SWEEP_LIMIT,
     DEFAULT_FOOTBALLDATA_EXPANSION_CODES,
     DEFAULT_FOOTBALLDATA_PRODUCTION_CODES,
     FOOTBALLDATA_TARGET_FIXTURE_COUNT,
+    ENABLE_CALIBRATED_DECISION_ENGINE,
 )
 from database.database import Base, engine, get_db
 from database.models import Fixture, HistoricalMatch, Prediction, Team
@@ -61,6 +69,9 @@ from schemas import (
 )
 from services.stats_service import refresh_team_statistics
 from services.fixture_enrichment import enrich_fixtures, summarize_enrichment
+from services.decision_preview import preview_for_enriched_fixture
+from services.decision_backtest import run_backtest_with_calibration_comparison
+from services.preview_calibration import CalibrationConfig, select_best_candidate_with_calibration
 from utils.competitions import is_competition_admitted, resolve_competition
 from utils.football import (
     clamp,
@@ -461,6 +472,7 @@ def _app_status_payload():
             "/dates/available",
             "/day-summary",
             "/debug/enrichment",
+            "/debug/decision-engine/compare",
             "/status",
             "/scrape/today",
             "/fixtures",
@@ -645,6 +657,128 @@ def _write_enrichment_debug_report(report: dict, requested_date: calendar_date) 
     output_path = output_dir / f"enrichment_debug_{requested_date.isoformat()}_{timestamp}.json"
     output_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
     return output_path.as_posix()
+
+
+def _write_engine_compare_artifact(report: dict, requested_date: calendar_date) -> str:
+    output_dir = ARTIFACTS_DIR / "engine_compare"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    output_path = output_dir / f"engine_compare_{requested_date.isoformat()}_{timestamp}.json"
+    output_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    return output_path.as_posix()
+
+
+def _market_mapping(candidate_market: str) -> tuple[str, str]:
+    key = str(candidate_market or "").strip().lower()
+    if key == "over 1.5":
+        return "Over1.5", "Over 1.5"
+    if key == "over 2.5":
+        return "Over2.5", "Over 2.5"
+    if key == "under 3.5":
+        return "Under3.5", "Under 3.5"
+    if key == "btts":
+        return "BTTS", "BTTS"
+    if key == "home or draw (1x)":
+        return "DoubleChance", "1X"
+    if key == "away or draw (x2)":
+        return "DoubleChance", "X2"
+    return "Preview", str(candidate_market or "Preview")
+
+
+def _calibrated_engine_config() -> CalibrationConfig:
+    min_conf_raw = str(CALIBRATED_ENGINE_MIN_CONFIDENCE or "").strip()
+    min_conf = None
+    if min_conf_raw:
+        try:
+            min_conf = max(min(float(min_conf_raw), 1.0), 0.0)
+        except ValueError:
+            min_conf = None
+    return CalibrationConfig(
+        enabled=bool(ENABLE_CALIBRATED_DECISION_ENGINE),
+        min_market_samples=max(int(CALIBRATED_ENGINE_MIN_MARKET_SAMPLES), 0),
+        min_market_hit_rate=max(min(float(CALIBRATED_ENGINE_MIN_MARKET_HIT_RATE), 1.0), 0.0),
+        suppress_underperforming_markets=bool(CALIBRATED_ENGINE_SUPPRESS_UNDERPERFORMING_MARKETS),
+        underperformance_penalty_scale=max(float(CALIBRATED_ENGINE_UNDERPERFORMANCE_PENALTY_SCALE), 0.0),
+        low_evidence_penalty=max(float(CALIBRATED_ENGINE_LOW_EVIDENCE_PENALTY), 0.0),
+        min_confidence_after_calibration=min_conf,
+    )
+
+
+def _calibrated_engine_picks(db: Session, match_date: Optional[calendar_date], limit: int = 20):
+    resolved_date = _resolve_requested_date(match_date)
+    start, end = _resolve_fixture_window(resolved_date)
+    fixtures = (
+        db.query(Fixture)
+        .filter(Fixture.date >= start, Fixture.date < end, Fixture.status == "scheduled")
+        .order_by(Fixture.date.asc())
+        .all()
+    )
+    if not fixtures:
+        return {"picks": [], "engine_path": "calibrated_engine_no_fixtures", "fallback_reason": "no_scheduled_fixtures"}
+
+    lookback_start = resolved_date - timedelta(days=max(int(CALIBRATED_ENGINE_EVIDENCE_LOOKBACK_DAYS), 1))
+    compare = run_backtest_with_calibration_comparison(
+        db,
+        lookback_start,
+        resolved_date - timedelta(days=1),
+        calibration_config=_calibrated_engine_config(),
+    )
+    evidence = compare.get("market_evidence", {})
+    calibration_config = _calibrated_engine_config()
+
+    enrichment_map = enrich_fixtures(db, fixtures)
+    picks = []
+    skipped = 0
+    for fixture in fixtures:
+        enrichment = enrichment_map.get(fixture.id) or {}
+        fixture_preview = preview_for_enriched_fixture(enrichment)
+        best = select_best_candidate_with_calibration(
+            fixture_preview=fixture_preview,
+            enrichment_completeness=str(enrichment.get("enrichment_completeness", "missing")),
+            config=calibration_config,
+            market_evidence=evidence,
+        )
+        if not best:
+            skipped += 1
+            continue
+
+        market, selection = _market_mapping(str(best.get("candidate_market") or "Preview"))
+        confidence = float(best.get("confidence_score", 0.0) or 0.0)
+        fair_odds = round(1.0 / confidence, 2) if confidence > 0 else None
+        confidence_score = round(confidence * 100, 1)
+        picks.append(
+            {
+                "fixture_id": fixture.id,
+                "match": f"{fixture.home.name} vs {fixture.away.name}" if fixture.home and fixture.away else "Unknown",
+                "league": fixture.league,
+                "date": str(fixture.date),
+                "market": market,
+                "selection": selection,
+                "probability": round(confidence, 3),
+                "market_probability": round(confidence, 3),
+                "edge": round(confidence - 0.5, 3),
+                "fair_odds": fair_odds,
+                "rank_score": confidence_score,
+                "stake": round(max(confidence - 0.45, 0.0) * 10, 2),
+                "confidence": best.get("confidence_band", "low"),
+                "confidence_score": confidence_score,
+                "confidence_grade": _confidence_grade(confidence_score),
+                "odds": None,
+                "expected_home_goals": None,
+                "expected_away_goals": None,
+                "main_reasons": [str(best.get("explanation") or "Calibrated preview selection.")],
+                "risk_notes": [f"enrichment_completeness={enrichment.get('enrichment_completeness', 'missing')}"],
+            }
+        )
+
+    picks.sort(key=lambda item: item["confidence_score"], reverse=True)
+    return {
+        "picks": picks[:limit],
+        "engine_path": "calibrated_engine",
+        "fallback_reason": "insufficient_calibrated_candidates" if (not picks and skipped > 0) else None,
+        "skipped_fixtures": skipped,
+        "evidence_summary": compare.get("comparison", {}),
+    }
 
 
 def _competition_flags(league_name: Optional[str]) -> dict:
@@ -2109,6 +2243,48 @@ def debug_fixture_enrichment(
     return report
 
 
+@app.get("/debug/decision-engine/compare")
+def debug_decision_engine_compare(
+    match_date: Optional[calendar_date] = Query(None, alias="date", description="Day in YYYY-MM-DD format; defaults to today"),
+    limit: int = Query(20, ge=1, le=50),
+    min_edge: float = Query(0.025, ge=0.0, le=1.0),
+    db: Session = Depends(get_db),
+):
+    requested_date = _resolve_requested_date(match_date)
+    resolved_limit = _resolve_limit(limit)
+    resolved_min_edge = _resolve_min_edge(min_edge)
+
+    legacy_pairs = _top_predictions(db, resolved_limit, resolved_min_edge, requested_date)
+    legacy = [_serialize_top_prediction(prediction, details) for prediction, details in legacy_pairs]
+
+    calibrated = _calibrated_engine_picks(db, requested_date, limit=resolved_limit)
+    calibrated_picks = list(calibrated.get("picks", []))
+
+    report = {
+        "mode": "read_only_engine_compare",
+        "requested_date": requested_date.isoformat(),
+        "config": {
+            "enable_calibrated_decision_engine": bool(ENABLE_CALIBRATED_DECISION_ENGINE),
+            "calibrated_engine_min_market_samples": CALIBRATED_ENGINE_MIN_MARKET_SAMPLES,
+            "calibrated_engine_min_market_hit_rate": CALIBRATED_ENGINE_MIN_MARKET_HIT_RATE,
+            "calibrated_engine_suppress_underperforming_markets": bool(CALIBRATED_ENGINE_SUPPRESS_UNDERPERFORMING_MARKETS),
+            "calibrated_engine_evidence_lookback_days": CALIBRATED_ENGINE_EVIDENCE_LOOKBACK_DAYS,
+        },
+        "summary": {
+            "legacy_count": len(legacy),
+            "calibrated_count": len(calibrated_picks),
+            "legacy_avg_confidence_score": round(sum(item.get("confidence_score", 0.0) for item in legacy) / len(legacy), 3) if legacy else 0.0,
+            "calibrated_avg_confidence_score": round(sum(item.get("confidence_score", 0.0) for item in calibrated_picks) / len(calibrated_picks), 3) if calibrated_picks else 0.0,
+            "engine_path": calibrated.get("engine_path", "calibrated_engine"),
+            "fallback_reason": calibrated.get("fallback_reason"),
+        },
+        "legacy_picks": legacy,
+        "calibrated_picks": calibrated_picks,
+    }
+    report["artifact_path"] = _write_engine_compare_artifact(report, requested_date)
+    return report
+
+
 @app.get("/scrape/today", response_model=ScrapeFixturesResponse)
 @app.post("/scrape/today", response_model=ScrapeFixturesResponse)
 def scrape_today_fixtures(
@@ -2313,11 +2489,33 @@ def get_top_predictions(
 ):
     resolved_limit = _resolve_limit(limit)
     resolved_min_edge = _resolve_min_edge(min_edge)
+    engine_path = "legacy_engine"
+    fallback_reason = None
+
+    if ENABLE_CALIBRATED_DECISION_ENGINE:
+        calibrated = _calibrated_engine_picks(db, match_date, limit=resolved_limit)
+        calibrated_picks = calibrated.get("picks", [])
+        if calibrated_picks:
+            logger.info("Top predictions served via calibrated engine path")
+            return {
+                "count": len(calibrated_picks),
+                "requested_date": _requested_date_value(match_date),
+                "note": f"engine_path={calibrated.get('engine_path', 'calibrated_engine')}",
+                "available_dates": _available_date_labels(db, predicted_only=True) if not calibrated_picks else [],
+                "picks": calibrated_picks,
+            }
+        engine_path = "calibrated_engine_fallback_to_legacy"
+        fallback_reason = calibrated.get("fallback_reason") or "no_calibrated_picks"
+        logger.info("Calibrated engine fallback triggered; using legacy top predictions (%s)", fallback_reason)
+
     picks = _top_predictions(db, resolved_limit, resolved_min_edge, match_date)
+    note = _empty_date_note(db, match_date) if not picks else None
+    if engine_path != "legacy_engine":
+        note = f"engine_path={engine_path}; fallback_reason={fallback_reason}" if fallback_reason else f"engine_path={engine_path}"
     return {
         "count": len(picks),
         "requested_date": _requested_date_value(match_date),
-        "note": _empty_date_note(db, match_date) if not picks else None,
+        "note": note,
         "available_dates": _available_date_labels(db, predicted_only=True) if not picks else [],
         "picks": [_serialize_top_prediction(prediction, details) for prediction, details in picks],
     }

@@ -107,3 +107,37 @@ def calibrate_candidate(
         },
     }
     return calibrated
+
+
+def select_best_candidate_with_calibration(
+    fixture_preview: dict,
+    enrichment_completeness: str,
+    config: CalibrationConfig,
+    market_evidence: Optional[Dict[str, dict]] = None,
+) -> Optional[dict]:
+    candidates = list(fixture_preview.get("candidate_markets") or [])
+    if not candidates:
+        return None
+
+    adjusted = []
+    for candidate in candidates:
+        calibrated = calibrate_candidate(
+            candidate=candidate,
+            enrichment_completeness=enrichment_completeness,
+            config=config,
+            market_evidence=market_evidence,
+        )
+        if calibrated:
+            adjusted.append(calibrated)
+
+    if not adjusted:
+        return None
+
+    adjusted.sort(
+        key=lambda item: (
+            float(item.get("confidence_score", 0.0) or 0.0),
+            str(item.get("candidate_market") or ""),
+        ),
+        reverse=True,
+    )
+    return adjusted[0]
