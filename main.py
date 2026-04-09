@@ -30,6 +30,10 @@ from config import (
     FOOTBALLDATA_TARGET_FIXTURE_COUNT,
     ENABLE_CALIBRATED_DECISION_ENGINE,
     ENABLE_ENGINE_SHADOW_COMPARE_ARTIFACT,
+    PUBLIC_WEB_ALLOWED_SOURCES,
+    PUBLIC_WEB_DEFAULT_KICKOFF_TIME,
+    PUBLIC_WEB_ENABLED,
+    PUBLIC_WEB_REQUIRED_SUCCESS,
 )
 from database.database import Base, engine, get_db
 from database.models import Fixture, HistoricalMatch, Prediction, Team
@@ -80,6 +84,7 @@ from utils.football import (
     current_season_year,
     day_bounds,
     day_bounds_for_date,
+    normalize_status,
     normalize_team_name,
 )
 
@@ -285,6 +290,240 @@ def _reload_fixtures_by_ids(db: Session, fixture_ids):
     )
 
 
+def _parse_public_web_kickoff(requested_date: calendar_date, kickoff_time: Optional[str]) -> datetime:
+    raw_time = (kickoff_time or PUBLIC_WEB_DEFAULT_KICKOFF_TIME or "12:00").strip()
+    try:
+        hour_str, minute_str = raw_time.split(":", 1)
+        hour = max(min(int(hour_str), 23), 0)
+        minute = max(min(int(minute_str), 59), 0)
+    except Exception:
+        hour, minute = 12, 0
+    return datetime.combine(requested_date, datetime.min.time()).replace(hour=hour, minute=minute)
+
+
+def _get_or_create_team_for_public_web(db: Session, name: str, league: Optional[str]) -> Team:
+    normalized_name = normalize_team_name(name)
+    team = db.query(Team).filter(Team.name == normalized_name).first()
+    if team:
+        if league and (not team.league or team.league == "Unknown"):
+            team.league = league
+        return team
+
+    team = Team(
+        name=normalized_name,
+        league=league or "Unknown",
+        country=None,
+        avg_scored=1.25,
+        avg_conceded=1.25,
+        attack_strength=1.0,
+        defense_strength=1.0,
+    )
+    db.add(team)
+    db.flush()
+    return team
+
+
+def _collect_public_web_bundle(db: Session, match_date: Optional[calendar_date] = None, days_ahead: int = 0):
+    requested_date = _resolve_requested_date(match_date) + timedelta(days=max(int(days_ahead or 0), 0))
+    configured_allowed_sources = tuple(source.strip().lower() for source in PUBLIC_WEB_ALLOWED_SOURCES if source.strip())
+    allowlist_active = bool(configured_allowed_sources)
+    allowlist_mode = "explicit_allowlist" if allowlist_active else "all_supported_sources"
+    base_status = {
+        "enabled": bool(PUBLIC_WEB_ENABLED),
+        "requested_date": requested_date.isoformat(),
+        "ran": False,
+        "raw_fixtures": 0,
+        "survived_unique_fixtures": 0,
+        "duplicates_removed": 0,
+        "failed": False,
+        "failure_reason": None,
+        "adapter_failures": {},
+        "allowlist_mode": allowlist_mode,
+        "allowed_sources": list(configured_allowed_sources),
+    }
+    if not PUBLIC_WEB_ENABLED:
+        base_status["failure_reason"] = "PUBLIC_WEB_ENABLED is false"
+        return {
+            "source": "public_web",
+            "source_breakdown": {"public_web": 0},
+            "raw_fixtures": 0,
+            "fixtures": [],
+            "source_status": {"public_web": base_status},
+            "note": "public_web is disabled by config.",
+        }
+
+    from utils.browser_assist import BrowserAssistPlan
+    from utils.browser_sources import get_default_browser_adapters
+
+    adapters = get_default_browser_adapters(configured_allowed_sources)
+    if not adapters:
+        base_status.update(
+            {
+                "ran": True,
+                "failed": True,
+                "failure_reason": (
+                    "No public_web adapters matched PUBLIC_WEB_ALLOWED_SOURCES."
+                    if allowlist_active
+                    else "No public_web adapters are currently implemented in this build."
+                ),
+            }
+        )
+        return {
+            "source": "public_web",
+            "source_breakdown": {"public_web": 0},
+            "raw_fixtures": 0,
+            "fixtures": [],
+            "source_status": {"public_web": base_status},
+            "note": base_status["failure_reason"],
+        }
+
+    plan = BrowserAssistPlan(
+        requested_date=requested_date.isoformat(),
+        coverage_status="debug",
+        trigger_eligible=True,
+        trigger_reasons=(),
+        adapters_configured=tuple(adapter.source_name for adapter in adapters),
+        target_fixture_count=0,
+        target_analyzable_count=0,
+        min_active_leagues=0,
+        note="public_web direct collection",
+    )
+
+    fixture_ids: list[int] = []
+    raw_candidates = 0
+    failures: dict[str, str] = {}
+
+    for adapter in adapters:
+        try:
+            discovered = adapter.discover(requested_date, plan) or []
+        except Exception as exc:
+            failures[adapter.source_name] = str(exc)
+            logger.warning("public_web adapter %s failed for %s: %s", adapter.source_name, requested_date.isoformat(), exc)
+            continue
+
+        raw_candidates += len(discovered)
+        for candidate in discovered:
+            home_name = normalize_team_name(candidate.home_team)
+            away_name = normalize_team_name(candidate.away_team)
+            if not home_name or not away_name or home_name == away_name:
+                continue
+
+            competition = resolve_competition("storage", name=candidate.competition_name)
+            league_name = (
+                competition.display_name
+                if competition
+                else (candidate.competition_name or "Public Web")
+            )
+            kickoff_dt = _parse_public_web_kickoff(requested_date, candidate.kickoff_time)
+            day_start = datetime.combine(requested_date, datetime.min.time())
+            day_end = day_start + timedelta(days=1)
+
+            try:
+                home_team = _get_or_create_team_for_public_web(db, home_name, league_name)
+                away_team = _get_or_create_team_for_public_web(db, away_name, league_name)
+
+                existing = (
+                    db.query(Fixture)
+                    .filter(
+                        Fixture.home_id == home_team.id,
+                        Fixture.away_id == away_team.id,
+                        Fixture.date >= day_start,
+                        Fixture.date < day_end,
+                    )
+                    .first()
+                )
+                if existing:
+                    existing.date = kickoff_dt
+                    existing.status = normalize_status(candidate.match_status, is_finished=False)
+                    if not existing.league or existing.league == "Unknown":
+                        existing.league = league_name
+                    db.flush()
+                    fixture_ids.append(existing.id)
+                    continue
+
+                fixture = Fixture(
+                    date=kickoff_dt,
+                    home_id=home_team.id,
+                    away_id=away_team.id,
+                    league=league_name,
+                    status=normalize_status(candidate.match_status, is_finished=False),
+                )
+                db.add(fixture)
+                db.flush()
+                if fixture.id is not None:
+                    fixture_ids.append(fixture.id)
+            except Exception as exc:
+                db.rollback()
+                failures[adapter.source_name] = str(exc)
+                logger.warning("public_web candidate ingest failed (%s): %s", adapter.source_name, exc)
+
+    try:
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        failures["commit"] = str(exc)
+
+    unique_ids = sorted(set(fixture_ids))
+    status = dict(base_status)
+    status.update(
+        {
+            "ran": True,
+            "raw_fixtures": int(raw_candidates),
+            "survived_unique_fixtures": len(unique_ids),
+            "duplicates_removed": max(raw_candidates - len(unique_ids), 0),
+            "failed": bool(failures),
+            "failure_reason": "; ".join(f"{k}: {v}" for k, v in failures.items()) if failures else None,
+            "adapter_failures": failures,
+        }
+    )
+    logger.info(
+        "public_web collection %s | mode=%s allowed=%s raw=%s unique=%s dedupe_removed=%s failed=%s reason=%s",
+        requested_date.isoformat(),
+        allowlist_mode,
+        ",".join(configured_allowed_sources) if configured_allowed_sources else "ALL",
+        status["raw_fixtures"],
+        status["survived_unique_fixtures"],
+        status["duplicates_removed"],
+        status["failed"],
+        status["failure_reason"],
+    )
+    return {
+        "source": "public_web",
+        "source_breakdown": {"public_web": len(unique_ids)},
+        "raw_fixtures": int(raw_candidates),
+        "fixtures": _reload_fixtures_by_ids(db, unique_ids),
+        "source_status": {"public_web": status},
+        "note": None if not failures else f"public_web partial failure: {status['failure_reason']}",
+    }
+
+
+def _public_web_failure_bundle(match_date: Optional[calendar_date], reason: str) -> dict:
+    safe_reason = str(reason or "unknown public_web failure")
+    configured_allowed_sources = tuple(source.strip().lower() for source in PUBLIC_WEB_ALLOWED_SOURCES if source.strip())
+    allowlist_active = bool(configured_allowed_sources)
+    return {
+        "source": "public_web",
+        "source_breakdown": {"public_web": 0},
+        "raw_fixtures": 0,
+        "fixtures": [],
+        "source_status": {
+            "public_web": {
+                "enabled": bool(PUBLIC_WEB_ENABLED),
+                "requested_date": _requested_date_value(match_date),
+                "ran": True,
+                "raw_fixtures": 0,
+                "survived_unique_fixtures": 0,
+                "duplicates_removed": 0,
+                "failed": True,
+                "failure_reason": safe_reason,
+                "allowlist_mode": "explicit_allowlist" if allowlist_active else "all_supported_sources",
+                "allowed_sources": list(configured_allowed_sources),
+            }
+        },
+        "note": f"public_web failed safely: {safe_reason}",
+    }
+
+
 def _collect_openligadb_bundle(db: Session, match_date: Optional[calendar_date] = None, days_ahead: int = 0):
     from scrapers.openligadb_scraper import OpenLigaDBScraper
 
@@ -295,11 +534,22 @@ def _collect_openligadb_bundle(db: Session, match_date: Optional[calendar_date] 
         scraper.close()
 
     fixture_ids = _scraped_fixture_ids(scraped)
+    status = {
+        "enabled": True,
+        "requested_date": _requested_date_value(match_date),
+        "ran": True,
+        "raw_fixtures": len(fixture_ids),
+        "survived_unique_fixtures": len(set(fixture_ids)),
+        "duplicates_removed": max(len(fixture_ids) - len(set(fixture_ids)), 0),
+        "failed": False,
+        "failure_reason": None,
+    }
     return {
         "source": "openligadb",
         "source_breakdown": {"openligadb": len(fixture_ids)},
         "raw_fixtures": len(fixture_ids),
         "fixtures": _reload_fixtures_by_ids(db, fixture_ids),
+        "source_status": {"openligadb": status},
     }
 
 
@@ -315,6 +565,18 @@ def _collect_footballdata_bundle(db: Session, match_date: Optional[calendar_date
             "fixtures": [],
             "note": "FOOTBALL_DATA_API_KEY not set",
             "missing_api_key": True,
+            "source_status": {
+                "footballdata": {
+                    "enabled": True,
+                    "requested_date": _requested_date_value(match_date),
+                    "ran": False,
+                    "raw_fixtures": 0,
+                    "survived_unique_fixtures": 0,
+                    "duplicates_removed": 0,
+                    "failed": True,
+                    "failure_reason": "FOOTBALL_DATA_API_KEY not set",
+                }
+            },
         }
 
     scraper = FootballDataAPI(api_key)
@@ -397,6 +659,20 @@ def _collect_footballdata_bundle(db: Session, match_date: Optional[calendar_date
     elif broad_fixture_ids:
         note = "football-data collection used a broad daily sweep plus targeted competition passes."
 
+    unique_fixture_ids = list(combined.keys())
+    status = {
+        "enabled": True,
+        "requested_date": _requested_date_value(match_date),
+        "ran": True,
+        "raw_fixtures": len(broad_fixture_ids) + len(_scraped_fixture_ids(production_scraped)) + len(_scraped_fixture_ids(expansion_scraped)),
+        "survived_unique_fixtures": len(unique_fixture_ids),
+        "duplicates_removed": max(
+            (len(broad_fixture_ids) + len(_scraped_fixture_ids(production_scraped)) + len(_scraped_fixture_ids(expansion_scraped))) - len(unique_fixture_ids),
+            0,
+        ),
+        "failed": False,
+        "failure_reason": None,
+    }
     return {
         "source": "footballdata",
         "source_breakdown": {
@@ -408,6 +684,7 @@ def _collect_footballdata_bundle(db: Session, match_date: Optional[calendar_date
         "fixtures": _reload_fixtures_by_ids(db, fixture_ids),
         "note": note,
         "missing_api_key": False,
+        "source_status": {"footballdata": status},
     }
 
 
@@ -415,9 +692,12 @@ def _combine_collection_bundles(db: Session, *bundles):
     fixture_ids = set()
     raw_total = 0
     source_breakdown = {}
+    source_status = {}
 
     for bundle in bundles:
         raw_total += int(bundle.get("raw_fixtures", 0) or 0)
+        for key, value in (bundle.get("source_status") or {}).items():
+            source_status[key] = value
         for key, value in (bundle.get("source_breakdown") or {}).items():
             source_breakdown[key] = source_breakdown.get(key, 0) + int(value or 0)
         for fixture in bundle.get("fixtures", []):
@@ -427,6 +707,7 @@ def _combine_collection_bundles(db: Session, *bundles):
     return {
         "raw_fixtures": raw_total,
         "source_breakdown": source_breakdown,
+        "source_status": source_status,
         "fixture_ids": sorted(fixture_ids),
         "fixtures": _reload_fixtures_by_ids(db, sorted(fixture_ids)),
     }
@@ -441,13 +722,34 @@ def _collect_fixture_bundle(source: str, db: Session, match_date: Optional[calen
         bundle = _collect_footballdata_bundle(db, match_date=match_date, days_ahead=days_ahead)
         if bundle.get("missing_api_key"):
             raise HTTPException(status_code=400, detail="FOOTBALL_DATA_API_KEY not set")
+    elif normalized_source in {"public_web", "public-web", "publicweb"}:
+        try:
+            bundle = _collect_public_web_bundle(db, match_date=match_date, days_ahead=days_ahead)
+        except Exception as exc:
+            logger.exception("public_web collection crashed unexpectedly; returning safe failure bundle")
+            bundle = _public_web_failure_bundle(match_date, str(exc))
+        if PUBLIC_WEB_REQUIRED_SUCCESS and bundle.get("source_status", {}).get("public_web", {}).get("failed"):
+            raise HTTPException(status_code=503, detail=bundle.get("note") or "public_web collection failed")
     elif normalized_source in {"hybrid", "auto"}:
         football_bundle = _collect_footballdata_bundle(db, match_date=match_date, days_ahead=days_ahead)
         openligadb_bundle = _collect_openligadb_bundle(db, match_date=match_date, days_ahead=days_ahead)
-        bundle = _combine_collection_bundles(db, football_bundle, openligadb_bundle)
+        bundles = [football_bundle, openligadb_bundle]
+        public_web_bundle = None
+        if PUBLIC_WEB_ENABLED:
+            try:
+                public_web_bundle = _collect_public_web_bundle(db, match_date=match_date, days_ahead=days_ahead)
+            except Exception as exc:
+                logger.exception("public_web collection crashed in hybrid mode; continuing with API sources")
+                public_web_bundle = _public_web_failure_bundle(match_date, str(exc))
+            bundles.append(public_web_bundle)
+        bundle = _combine_collection_bundles(db, *bundles)
         bundle["source"] = "hybrid"
-        if football_bundle.get("note"):
-            bundle["note"] = football_bundle["note"]
+        notes = [football_bundle.get("note")]
+        if public_web_bundle:
+            notes.append(public_web_bundle.get("note"))
+        notes = [note for note in notes if note]
+        if notes:
+            bundle["note"] = " | ".join(notes)
     else:
         raise HTTPException(status_code=400, detail=f"Unsupported source: {source}")
 
@@ -458,7 +760,76 @@ def _collect_fixture_bundle(source: str, db: Session, match_date: Optional[calen
     bundle["unique_fixtures"] = unique_count
     bundle["duplicates_removed"] = max(int(bundle.get("raw_fixtures", 0)) - unique_count, 0)
     bundle["fixture_enrichment"] = enrich_fixtures(db, fixtures)
+    if bundle.get("source_status"):
+        for source_name, status in bundle["source_status"].items():
+            logger.info(
+                "source_status[%s] ran=%s raw=%s unique=%s duplicates_removed=%s failed=%s reason=%s",
+                source_name,
+                status.get("ran"),
+                status.get("raw_fixtures"),
+                status.get("survived_unique_fixtures"),
+                status.get("duplicates_removed"),
+                status.get("failed"),
+                status.get("failure_reason"),
+            )
     return bundle
+
+
+def _source_probe_for_date(
+    db: Session,
+    source: str,
+    requested_date: calendar_date,
+) -> dict:
+    normalized_source = (source or "").strip().lower()
+    result = {
+        "source": source,
+        "enabled": True,
+        "ran": False,
+        "raw_fixtures": 0,
+        "survived_deduplication": 0,
+        "duplicates_removed": 0,
+        "failed": False,
+        "failure_reason": None,
+        "allowlist_mode": None,
+        "allowed_sources": [],
+        "source_breakdown": {},
+    }
+
+    try:
+        bundle = _collect_fixture_bundle(normalized_source, db, match_date=requested_date)
+        status_payload = dict(bundle.get("source_status", {}).get(normalized_source, {}))
+        result.update(
+            {
+                "enabled": bool(status_payload.get("enabled", True)),
+                "ran": bool(status_payload.get("ran", True)),
+                "raw_fixtures": int(status_payload.get("raw_fixtures", bundle.get("raw_fixtures", 0))),
+                "survived_deduplication": int(status_payload.get("survived_unique_fixtures", bundle.get("unique_fixtures", 0))),
+                "duplicates_removed": int(status_payload.get("duplicates_removed", bundle.get("duplicates_removed", 0))),
+                "failed": bool(status_payload.get("failed", False)),
+                "source_breakdown": dict(bundle.get("source_breakdown", {})),
+                "failure_reason": status_payload.get("failure_reason") or bundle.get("note"),
+                "allowlist_mode": status_payload.get("allowlist_mode"),
+                "allowed_sources": list(status_payload.get("allowed_sources", [])),
+            }
+        )
+    except HTTPException as exc:
+        result.update(
+            {
+                "ran": False,
+                "failed": True,
+                "failure_reason": str(exc.detail),
+            }
+        )
+    except Exception as exc:
+        result.update(
+            {
+                "ran": False,
+                "failed": True,
+                "failure_reason": str(exc),
+            }
+        )
+
+    return result
 
 
 def _scrape_fixtures(source: str, db: Session, match_date: Optional[calendar_date] = None, days_ahead: int = 0):
@@ -475,6 +846,7 @@ def _app_status_payload():
             "/dates/available",
             "/day-summary",
             "/debug/enrichment",
+            "/debug/sources/status",
             "/debug/decision-engine/mode",
             "/debug/decision-engine/compare",
             "/status",
@@ -1254,7 +1626,7 @@ def _render_homepage(db: Session):
               linear-gradient(180deg, #fbf7ef 0%, var(--bg) 100%);
           }}
           .wrap {{
-            max-width: 1160px;
+            max-width: 1340px;
             margin: 0 auto;
             padding: 18px 14px 28px;
           }}
@@ -1499,61 +1871,75 @@ def _render_homepage(db: Session):
           @media (min-width: 1024px) {{
             .stats-grid {{ grid-template-columns: repeat(4, minmax(0, 1fr)); }}
             .picks {{ grid-template-columns: repeat(3, minmax(0, 1fr)); }}
+            section {{ padding: 20px; }}
+            .stat {{ padding: 16px 18px; }}
+            .pick-card, .empty-card {{ padding: 16px; }}
+          }}
+          @media (min-width: 1280px) {{
+            .picks {{ grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }}
+            .date-strip {{ grid-template-columns: repeat(4, minmax(0, 1fr)); }}
+            .hero {{
+              grid-template-columns: minmax(0, 1.4fr) minmax(320px, 1fr);
+              align-items: start;
+            }}
+            .hero .actions {{
+              justify-content: flex-end;
+              align-content: flex-start;
+            }}
           }}
         </style>
       </head>
       <body>
         <main class="wrap">
           <section class="hero">
-            <h1>Football Prediction Dashboard</h1>
+            <h1>Today’s Football Picks, At a Glance</h1>
             <p>
-              Mobile-first live board for fixture coverage, prediction health, and top-ranked picks.
-              Select a date, run the pipeline once, and monitor the strongest outcomes with clean
-              status context in one place.
+              Pick a date, refresh the run when needed, and follow the strongest selections in one clear view.
+              You’ll see coverage, prediction readiness, and top picks without digging through raw API output.
             </p>
             <div class="actions">
               <a id="top-json-link" class="primary" href="/board?date={today}">Readable Board</a>
               <a id="all-json-link" href="/matchday?date={today}">Readable Matchday</a>
               <a id="fixtures-json-link" href="/fixtures-view?date={today}">Readable Fixtures</a>
               <a id="summary-json-link" href="/summary?date={today}">Readable Summary</a>
-              <a href="/docs">Swagger Docs</a>
-              <a href="/status">API Status</a>
+              <a href="/docs">API Docs</a>
+              <a href="/status">System Status</a>
             </div>
           </section>
 
           <section class="stats-grid">
             <div class="stat">
-              <div class="label">Upcoming Fixtures (7 days)</div>
+              <div class="label">Upcoming matches (next 7 days)</div>
               <div class="value">{fixture_count}</div>
             </div>
             <div class="stat">
-              <div class="label">Stored Predictions (7 days)</div>
+              <div class="label">Predictions saved (next 7 days)</div>
               <div class="value">{prediction_count}</div>
             </div>
             <div class="stat">
-              <div class="label">Tracked Teams</div>
+              <div class="label">Teams in database</div>
               <div class="value">{team_count}</div>
             </div>
             <div class="stat">
-              <div class="label">App Version</div>
+              <div class="label">Version</div>
               <div class="value">{escape(APP_VERSION)}</div>
             </div>
           </section>
 
           <section>
             <div class="section-head">
-              <h2>Available Dates</h2>
+              <h2>Choose a match day</h2>
               <span id="current-date-label">Loading dates...</span>
             </div>
             <div class="toolbar">
               <input id="date-input" type="date" value="{today}" />
-              <button id="run-date-btn" type="button">Run Selected Date</button>
+              <button id="run-date-btn" type="button">Refresh this date</button>
             </div>
-            <p id="status-line" class="status-line">Checking the latest stored fixtures and predictions...</p>
+            <p id="status-line" class="status-line">Checking the latest matches and predictions...</p>
             <div id="date-strip" class="date-strip">
               <article class="empty-card">
                 <h3>Loading dates</h3>
-                <p>The dashboard is preparing your available match days.</p>
+                <p>We’re preparing your available dates.</p>
               </article>
             </div>
             <button id="toggle-dates-btn" class="muted-link hidden" type="button">View more dates</button>
@@ -1561,13 +1947,13 @@ def _render_homepage(db: Session):
 
           <section class="top-board">
             <div class="section-head">
-              <h2>Top 20 Board</h2>
-              <span id="top-picks-caption">Live qualified board for the selected date</span>
+              <h2>Top 20 picks</h2>
+              <span id="top-picks-caption">Best available picks for the selected date</span>
             </div>
             <div id="picks" class="picks">
               <article class="empty-card">
                 <h3>Loading picks</h3>
-                <p>The dashboard will pull the strongest selections for the chosen date.</p>
+                <p>Finding the strongest options for this date.</p>
               </article>
             </div>
           </section>
@@ -1649,7 +2035,7 @@ def _render_homepage(db: Session):
               dateStrip.innerHTML = `
                 <article class="empty-card">
                   <h3>No stored dates yet</h3>
-                  <p>Run <code>POST /run?date=YYYY-MM-DD</code> from <a href="/docs">Swagger</a> to populate the database.</p>
+                  <p>No match days are saved yet. You can trigger a refresh from this page, or run <code>/run?date=YYYY-MM-DD</code> in <a href="/docs">API Docs</a>.</p>
                 </article>
               `;
               return;
@@ -1677,9 +2063,9 @@ def _render_homepage(db: Session):
               const note = payload?.note ? escapeHtml(payload.note) : "No picks stored for this date yet.";
               picksNode.innerHTML = `
                 <article class="empty-card">
-                  <h3>No ranked picks for ${{escapeHtml(currentDate)}}</h3>
+                  <h3>No picks yet for ${{escapeHtml(currentDate)}}</h3>
                   <p>${{note}}</p>
-                  <p class="meta">Try running the selected date to refresh fixtures, stats, and predictions for this board.</p>
+                  <p class="meta">Try refreshing this date to pull matches and generate fresh picks.</p>
                 </article>
               `;
               return;
@@ -1761,13 +2147,13 @@ def _render_homepage(db: Session):
             if (needsAutoCollect) {{
               autoCollectAttempts.add(currentDate);
               runInFlightDates.add(currentDate);
-              statusLine.textContent = `Auto-collecting fixtures and predictions for ${{currentDate}}...`;
+              statusLine.textContent = `Auto-refreshing matches and predictions for ${{currentDate}}...`;
               try {{
                 await fetchJson(`/run?source=hybrid&date=${{encodeURIComponent(currentDate)}}`);
                 await refreshDates(currentDate);
                 daySummary = await fetchJson(`/day-summary?date=${{encodeURIComponent(currentDate)}}`);
               }} catch (error) {{
-                statusLine.textContent = `Auto-collection failed for ${{currentDate}}: ${{error.message || "Unknown error"}}`;
+                statusLine.textContent = `Auto-refresh failed for ${{currentDate}}: ${{error.message || "Unknown error"}}`;
               }} finally {{
                 runInFlightDates.delete(currentDate);
               }}
@@ -1777,18 +2163,18 @@ def _render_homepage(db: Session):
             renderDateStrip(availableDates);
             renderPicks(payload);
             topPicksCaption.textContent = payload?.count
-              ? `Showing ${{payload.count}} ranked picks for ${{currentDate}}`
-              : `No qualified picks stored for ${{currentDate}}`;
+              ? `Showing ${{payload.count}} picks for ${{currentDate}}`
+              : `No saved picks yet for ${{currentDate}}`;
 
             const summary = availableDates.find((item) => item.date === currentDate);
             if (daySummary) {{
-              statusLine.textContent = `Live for ${{currentDate}}: ${{daySummary.raw_fixtures ?? 0}} collected, ${{daySummary.analyzable_fixtures ?? 0}} analyzable, ${{daySummary.predicted_fixtures ?? 0}} predicted fixtures, ${{daySummary.ranked_picks ?? 0}} ranked picks. Auto-refresh every 30 seconds.`;
+              statusLine.textContent = `Live for ${{currentDate}}: ${{daySummary.raw_fixtures ?? 0}} collected, ${{daySummary.analyzable_fixtures ?? 0}} ready to analyze, ${{daySummary.predicted_fixtures ?? 0}} with predictions, ${{daySummary.ranked_picks ?? 0}} on the board. Auto-refresh every 30 seconds.`;
             }} else if (summary) {{
-              statusLine.textContent = `Live from local data: ${{summary.fixtures}} fixtures, ${{summary.predictions}} fixture-level predictions on ${{currentDate}}. Auto-refresh every 30 seconds.`;
+              statusLine.textContent = `Using saved data: ${{summary.fixtures}} matches and ${{summary.predictions}} predicted fixtures for ${{currentDate}}. Auto-refresh every 30 seconds.`;
             }} else if (payload.note) {{
               statusLine.textContent = payload.note;
             }} else {{
-              statusLine.textContent = `No picks stored for ${{currentDate}} yet. Auto-refresh every 30 seconds.`;
+              statusLine.textContent = `No saved picks for ${{currentDate}} yet. Auto-refresh every 30 seconds.`;
             }}
           }}
 
@@ -1803,11 +2189,11 @@ def _render_homepage(db: Session):
             }} catch (error) {{
               picksNode.innerHTML = `
                 <article class="empty-card">
-                  <h3>Dashboard refresh failed</h3>
+                  <h3>Refresh failed</h3>
                   <p>${{escapeHtml(error.message || "Unknown error")}}</p>
                 </article>
               `;
-              statusLine.textContent = "The dashboard could not refresh right now.";
+              statusLine.textContent = "We couldn’t refresh the dashboard right now.";
             }} finally {{
               refreshInFlight = false;
             }}
@@ -1819,7 +2205,7 @@ def _render_homepage(db: Session):
             updateLinks(currentDate);
             setBusyState(true);
             runInFlightDates.add(currentDate);
-            statusLine.textContent = `Running scrape and predictions for ${{currentDate}}...`;
+            statusLine.textContent = `Refreshing matches and predictions for ${{currentDate}}...`;
 
             try {{
               const payload = await fetchJson(`/run?source=hybrid&date=${{encodeURIComponent(currentDate)}}`);
@@ -1833,10 +2219,10 @@ def _render_homepage(db: Session):
                 const created = payload?.results?.predictions_created ?? 0;
                 const analyzable = payload?.collection?.analyzable_fixtures ?? 0;
                 const ranked = payload?.collection?.ranked_picks ?? 0;
-                statusLine.textContent = `Run complete for ${{currentDate}}: ${{scraped}} fixtures collected, ${{analyzable}} analyzable, ${{created}} predictions stored, ${{ranked}} ranked picks.`;
+                statusLine.textContent = `Done for ${{currentDate}}: ${{scraped}} matches collected, ${{analyzable}} ready to analyze, ${{created}} predictions saved, and ${{ranked}} picks on the board.`;
               }}
             }} catch (error) {{
-              statusLine.textContent = `Run failed for ${{currentDate}}: ${{error.message || "Unknown error"}}`;
+              statusLine.textContent = `Couldn’t refresh ${{currentDate}}: ${{error.message || "Unknown error"}}`;
             }} finally {{
               runInFlightDates.delete(currentDate);
               setBusyState(false);
@@ -1895,7 +2281,7 @@ def _layout_shell(title: str, body: str) -> str:
               linear-gradient(180deg, #fbf7ef 0%, var(--bg) 100%);
           }}
           .wrap {{
-            max-width: 1100px;
+            max-width: 1340px;
             margin: 0 auto;
             padding: 36px 20px 56px;
           }}
@@ -2023,6 +2409,28 @@ def _layout_shell(title: str, body: str) -> str:
             border-radius: 6px;
             background: #efe8da;
           }}
+          @media (min-width: 1024px) {{
+            .card {{
+              border-radius: 18px;
+              padding: 16px;
+            }}
+            .grid.compact {{
+              grid-template-columns: repeat(3, minmax(0, 1fr));
+              gap: 12px;
+            }}
+            .grid.wide {{
+              grid-template-columns: repeat(4, minmax(0, 1fr));
+              gap: 12px;
+            }}
+            .table th, .table td {{
+              padding: 10px 12px;
+            }}
+          }}
+          @media (min-width: 1280px) {{
+            .grid.compact {{
+              grid-template-columns: repeat(4, minmax(0, 1fr));
+            }}
+          }}
         </style>
       </head>
       <body>
@@ -2038,8 +2446,8 @@ def _format_pick_card(rank: int, prediction: Prediction, details: dict) -> str:
     fixture = prediction.fixture
     match = f"{fixture.home.name} vs {fixture.away.name}" if fixture and fixture.home and fixture.away else "Unknown"
     league = fixture.league if fixture else "Unknown league"
-    reasons = "".join(f"<li>{escape(reason)}</li>" for reason in details["main_reasons"]) or "<li>No major supporting reasons recorded.</li>"
-    risks = "".join(f"<li>{escape(note)}</li>" for note in details["risk_notes"]) if details["risk_notes"] else "<li>No major risk flags on this board view.</li>"
+    reasons = "".join(f"<li>{escape(reason)}</li>" for reason in details["main_reasons"]) or "<li>No standout signals were recorded for this pick.</li>"
+    risks = "".join(f"<li>{escape(note)}</li>" for note in details["risk_notes"]) if details["risk_notes"] else "<li>No major warning signs were flagged here.</li>"
     return f"""
       <article class="card">
         <div class="section-head">
@@ -2050,21 +2458,21 @@ def _format_pick_card(rank: int, prediction: Prediction, details: dict) -> str:
         <p class="meta">{escape(str(league))} | {escape(str(fixture.date) if fixture else "")}</p>
         <p style="margin-top:12px;"><strong>{escape(market_display_name(prediction.market))}</strong>: {escape(prediction.selection or "")}</p>
         <div class="kv">
-          <div><span>Model Prob</span><br />{prediction.probability:.1%}</div>
-          <div><span>Market Prob</span><br />{details["market_probability"]:.1%}</div>
+          <div><span>Model probability</span><br />{prediction.probability:.1%}</div>
+          <div><span>Market probability</span><br />{details["market_probability"]:.1%}</div>
           <div><span>Edge</span><br />{prediction.edge:+.1%}</div>
-          <div><span>Best Odds</span><br />{prediction.odds or "-"}</div>
-          <div><span>Fair Odds</span><br />{details["fair_odds"] or "-"}</div>
-          <div><span>Rank Score</span><br />{details["rank_score"]}</div>
+          <div><span>Best odds</span><br />{prediction.odds or "-"}</div>
+          <div><span>Fair odds</span><br />{details["fair_odds"] or "-"}</div>
+          <div><span>Rank score</span><br />{details["rank_score"]}</div>
           <div><span>Stake</span><br />{prediction.stake:.2f}</div>
           <div><span>xG</span><br />{prediction.expected_home_goals:.2f}-{prediction.expected_away_goals:.2f}</div>
         </div>
         <div class="section">
-          <h3 style="font-size:1rem;">Why It Made The Board</h3>
+          <h3 style="font-size:1rem;">Why this pick stands out</h3>
           <ul class="list">{reasons}</ul>
         </div>
         <div class="section">
-          <h3 style="font-size:1rem;">Risk Notes</h3>
+          <h3 style="font-size:1rem;">Things to watch</h3>
           <ul class="list">{risks}</ul>
         </div>
       </article>
@@ -2088,8 +2496,8 @@ def _render_board_page(
     )
     body = f"""
       <section class="hero">
-        <h1>Readable Board</h1>
-        <p class="muted">Human-friendly ranked board for {escape(resolved_date.isoformat())}. This uses the same scoring logic as <code>/predictions/top</code>, just in a cleaner readable page.</p>
+        <h1>Top Picks Board</h1>
+        <p class="muted">A cleaner view of the strongest picks for {escape(resolved_date.isoformat())}, using the same scoring as <code>/predictions/top</code>.</p>
         <div class="actions">
           <a class="primary" href="/?date={escape(resolved_date.isoformat())}">Back To Dashboard</a>
           <a href="/matchday?date={escape(resolved_date.isoformat())}">Readable Matchday</a>
@@ -2102,7 +2510,7 @@ def _render_board_page(
           <h2>Top Board</h2>
           <span class="muted">{len(picks)} ranked picks | minimum edge {min_edge:.1%}</span>
         </div>
-        <div class="grid">
+        <div class="grid compact">
           {cards}
         </div>
       </section>
@@ -2125,8 +2533,8 @@ def _render_day_summary_page(
     )
     body = f"""
       <section class="hero">
-        <h1>Readable Day Summary</h1>
-        <p class="muted">Collection-to-board funnel for {escape(resolved_date.isoformat())}, so you can see where the day is getting thinner.</p>
+        <h1>Day Overview</h1>
+        <p class="muted">A quick snapshot of how {escape(resolved_date.isoformat())} moves from collected matches to final picks.</p>
         <div class="actions">
           <a class="primary" href="/?date={escape(resolved_date.isoformat())}">Back To Dashboard</a>
           <a href="/board?date={escape(resolved_date.isoformat())}">Readable Board</a>
@@ -2138,21 +2546,21 @@ def _render_day_summary_page(
           <h2>Funnel Metrics</h2>
           <span class="muted">How much survived each stage</span>
         </div>
-        <div class="grid">
-          <article class="card"><h3>Raw Collected</h3><p class="meta">{summary["raw_fixtures"]} fixtures before dedupe</p></article>
-          <article class="card"><h3>Unique Fixtures</h3><p class="meta">{summary["unique_fixtures"]} fixtures after dedupe</p></article>
-          <article class="card"><h3>Analyzable</h3><p class="meta">{summary["analyzable_fixtures"]} fixtures passed the data gate</p></article>
-          <article class="card"><h3>Predicted Fixtures</h3><p class="meta">{summary["predicted_fixtures"]} fixtures have stored predictions</p></article>
-          <article class="card"><h3>Qualified Markets</h3><p class="meta">{summary["qualified_markets"]} markets survived qualification</p></article>
-          <article class="card"><h3>Ranked Board</h3><p class="meta">{summary["ranked_picks"]} picks made the final board</p></article>
+        <div class="grid wide">
+          <article class="card"><h3>Collected</h3><p class="meta">{summary["raw_fixtures"]} matches before deduplication</p></article>
+          <article class="card"><h3>Unique Matches</h3><p class="meta">{summary["unique_fixtures"]} after deduplication</p></article>
+          <article class="card"><h3>Ready to Analyze</h3><p class="meta">{summary["analyzable_fixtures"]} passed the quality checks</p></article>
+          <article class="card"><h3>Predicted</h3><p class="meta">{summary["predicted_fixtures"]} matches have stored predictions</p></article>
+          <article class="card"><h3>Qualified Markets</h3><p class="meta">{summary["qualified_markets"]} markets cleared filters</p></article>
+          <article class="card"><h3>On the Board</h3><p class="meta">{summary["ranked_picks"]} picks made the final list</p></article>
         </div>
       </section>
       <section class="section">
         <div class="section-head">
-          <h2>Coverage Notes</h2>
+          <h2>Source contribution</h2>
           <span class="muted">{summary["active_leagues"]} active leagues | {summary["duplicates_removed"]} duplicates removed</span>
         </div>
-        {"<table class='table'><thead><tr><th>Source</th><th>Fixtures</th></tr></thead><tbody>" + source_rows + "</tbody></table>" if source_rows else "<div class='empty'><h3>No source breakdown stored</h3><p class='muted'>Run the hybrid collector for this date to see per-source contribution.</p></div>"}
+        {"<table class='table'><thead><tr><th>Source</th><th>Fixtures</th></tr></thead><tbody>" + source_rows + "</tbody></table>" if source_rows else "<div class='empty'><h3>No source breakdown yet</h3><p class='muted'>Refresh this date to see how each source contributed.</p></div>"}
       </section>
     """
     return _layout_shell(f"Readable Day Summary - {resolved_date.isoformat()}", body)
@@ -2181,8 +2589,8 @@ def _render_fixtures_page(db: Session, match_date: Optional[calendar_date] = Non
     )
     body = f"""
       <section class="hero">
-        <h1>Readable Fixtures</h1>
-        <p class="muted">Fixture list for {escape(resolved_date.isoformat())}.</p>
+        <h1>Match List</h1>
+        <p class="muted">All stored matches for {escape(resolved_date.isoformat())}.</p>
         <div class="actions">
           <a class="primary" href="/?date={escape(resolved_date.isoformat())}">Back To Dashboard</a>
           <a href="/matchday?date={escape(resolved_date.isoformat())}">Readable Matchday</a>
@@ -2192,10 +2600,10 @@ def _render_fixtures_page(db: Session, match_date: Optional[calendar_date] = Non
       </section>
       <section class="section">
         <div class="section-head">
-          <h2>Fixtures</h2>
-          <span class="muted">{len(fixtures)} fixtures</span>
+          <h2>Matches</h2>
+          <span class="muted">{len(fixtures)} total</span>
         </div>
-        {"<table class='table'><thead><tr><th>Kickoff</th><th>Home</th><th>Away</th><th>Competition</th><th>Status</th></tr></thead><tbody>" + rows + "</tbody></table>" if fixtures else f'<div class="empty"><h3>No fixtures</h3><p class="muted">{escape(_empty_date_note(db, resolved_date))}</p></div>'}
+        {"<table class='table'><thead><tr><th>Kickoff</th><th>Home</th><th>Away</th><th>Competition</th><th>Status</th></tr></thead><tbody>" + rows + "</tbody></table>" if fixtures else f'<div class="empty"><h3>No matches found</h3><p class="muted">{escape(_empty_date_note(db, resolved_date))}</p></div>'}
       </section>
     """
     return _layout_shell(f"Readable Fixtures - {resolved_date.isoformat()}", body)
@@ -2239,8 +2647,8 @@ def _render_matchday_page(db: Session, match_date: Optional[calendar_date] = Non
 
     body = f"""
       <section class="hero">
-        <h1>Readable Matchday</h1>
-        <p class="muted">Fixture-by-fixture readable page for {escape(resolved_date.isoformat())}, with the top stored predictions under each match.</p>
+        <h1>Matchday View</h1>
+        <p class="muted">Match-by-match view for {escape(resolved_date.isoformat())}, with the top saved picks under each game.</p>
         <div class="actions">
           <a class="primary" href="/?date={escape(resolved_date.isoformat())}">Back To Dashboard</a>
           <a href="/board?date={escape(resolved_date.isoformat())}">Readable Board</a>
@@ -2251,10 +2659,10 @@ def _render_matchday_page(db: Session, match_date: Optional[calendar_date] = Non
       <section class="section">
         <div class="section-head">
           <h2>Matches</h2>
-          <span class="muted">{len(fixtures)} fixtures</span>
+          <span class="muted">{len(fixtures)} total</span>
         </div>
-        <div class="grid">
-          {"".join(match_cards) if match_cards else f'<div class="empty"><h3>No stored matchday</h3><p class="muted">{escape(_empty_date_note(db, resolved_date))}</p></div>'}
+        <div class="grid compact">
+          {"".join(match_cards) if match_cards else f'<div class="empty"><h3>No matchday data yet</h3><p class="muted">{escape(_empty_date_note(db, resolved_date))}</p></div>'}
         </div>
       </section>
     """
@@ -2328,7 +2736,7 @@ def get_day_summary(
 
 @app.get("/debug/enrichment")
 def debug_fixture_enrichment(
-    source: str = Query("hybrid", description="Source: hybrid, openligadb or footballdata"),
+    source: str = Query("hybrid", description="Source: hybrid, openligadb, footballdata or public_web"),
     match_date: Optional[calendar_date] = Query(None, alias="date", description="Day in YYYY-MM-DD format; defaults to today"),
     sample_limit: int = Query(200, ge=1, le=1000, description="Maximum enriched fixtures to include in the response"),
     db: Session = Depends(get_db),
@@ -2354,6 +2762,44 @@ def debug_fixture_enrichment(
     }
     report["artifact_path"] = _write_enrichment_debug_report(report, requested_date)
     return report
+
+
+@app.get("/debug/sources/status")
+def debug_source_status(
+    match_date: Optional[calendar_date] = Query(None, alias="date", description="Day in YYYY-MM-DD format; defaults to today"),
+    db: Session = Depends(get_db),
+):
+    requested_date = _resolve_requested_date(match_date)
+    probes = {
+        "public_web": _source_probe_for_date(db, "public_web", requested_date),
+        "footballdata": _source_probe_for_date(db, "footballdata", requested_date),
+        "openligadb": _source_probe_for_date(db, "openligadb", requested_date),
+        "hybrid": _source_probe_for_date(db, "hybrid", requested_date),
+    }
+    probes["public_web"]["called_by"] = {
+        "/predictions/top": False,
+        "/day-summary": False,
+        "dashboard_auto_collection_via_/run?source=hybrid": bool(PUBLIC_WEB_ENABLED),
+    }
+    shared_hybrid_flow = {
+        "/predictions/top": False,
+        "/day-summary": False,
+        "dashboard_auto_collection_via_/run?source=hybrid": True,
+    }
+    probes["footballdata"]["called_by"] = dict(shared_hybrid_flow)
+    probes["openligadb"]["called_by"] = dict(shared_hybrid_flow)
+
+    return {
+        "mode": "read_only_debug",
+        "requested_date": requested_date.isoformat(),
+        "pipeline": {
+            "/predictions/top": "reads stored predictions only; does not invoke fixture collection",
+            "/day-summary": "reads stored fixtures/predictions only (source=stored); does not invoke fixture collection",
+            "dashboard": "auto-collect path calls /run?source=hybrid, which invokes football-data + OpenLigaDB (+ public_web when enabled)",
+        },
+        "sources": probes,
+        "next_step": f"GET /debug/sources/status?date={requested_date.isoformat()}",
+    }
 
 
 @app.get("/debug/decision-engine/compare")
@@ -2420,7 +2866,7 @@ def debug_decision_engine_mode():
 @app.get("/scrape/today", response_model=ScrapeFixturesResponse)
 @app.post("/scrape/today", response_model=ScrapeFixturesResponse)
 def scrape_today_fixtures(
-    source: str = Query("hybrid", description="Source: hybrid, openligadb or footballdata"),
+    source: str = Query("hybrid", description="Source: hybrid, openligadb, footballdata or public_web"),
     match_date: Optional[calendar_date] = Query(None, alias="date", description="Day in YYYY-MM-DD format; defaults to today"),
     db: Session = Depends(get_db),
 ):
@@ -2697,7 +3143,7 @@ def update_team_statistics(db: Session = Depends(get_db)):
 @app.get("/run", response_model=PipelineResponse)
 @app.post("/run", response_model=PipelineResponse)
 def run_full_pipeline(
-    source: str = Query("hybrid", description="Source: hybrid, openligadb or footballdata"),
+    source: str = Query("hybrid", description="Source: hybrid, openligadb, footballdata or public_web"),
     match_date: Optional[calendar_date] = Query(None, alias="date", description="Day in YYYY-MM-DD format; defaults to today"),
     db: Session = Depends(get_db),
 ):
