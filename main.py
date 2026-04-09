@@ -1,9 +1,11 @@
 import base64
+import json
 import logging
 import os
 import sys
 from datetime import date as calendar_date, datetime, timedelta
 from html import escape
+from pathlib import Path
 from secrets import compare_digest
 from typing import List, Optional
 
@@ -14,10 +16,18 @@ from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.orm import Session
 
 from config import (
+    CALIBRATED_ENGINE_EVIDENCE_LOOKBACK_DAYS,
+    CALIBRATED_ENGINE_LOW_EVIDENCE_PENALTY,
+    CALIBRATED_ENGINE_MIN_CONFIDENCE,
+    CALIBRATED_ENGINE_MIN_MARKET_HIT_RATE,
+    CALIBRATED_ENGINE_MIN_MARKET_SAMPLES,
+    CALIBRATED_ENGINE_SUPPRESS_UNDERPERFORMING_MARKETS,
+    CALIBRATED_ENGINE_UNDERPERFORMANCE_PENALTY_SCALE,
     FOOTBALLDATA_COMPETITION_SWEEP_LIMIT,
     DEFAULT_FOOTBALLDATA_EXPANSION_CODES,
     DEFAULT_FOOTBALLDATA_PRODUCTION_CODES,
     FOOTBALLDATA_TARGET_FIXTURE_COUNT,
+    ENABLE_CALIBRATED_DECISION_ENGINE,
 )
 from database.database import Base, engine, get_db
 from database.models import Fixture, HistoricalMatch, Prediction, Team
@@ -58,6 +68,10 @@ from schemas import (
     UpdateStatsResponse,
 )
 from services.stats_service import refresh_team_statistics
+from services.fixture_enrichment import enrich_fixtures, summarize_enrichment
+from services.decision_preview import preview_for_enriched_fixture
+from services.decision_backtest import run_backtest_with_calibration_comparison
+from services.preview_calibration import CalibrationConfig, select_best_candidate_with_calibration
 from utils.competitions import is_competition_admitted, resolve_competition
 from utils.football import (
     clamp,
@@ -74,6 +88,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 APP_VERSION = "1.6.4"
+ARTIFACTS_DIR = Path("artifacts")
 
 SITE_ACCESS_USERNAME = os.getenv("SITE_ACCESS_USERNAME", "").strip()
 SITE_ACCESS_PASSWORD = os.getenv("SITE_ACCESS_PASSWORD", "").strip()
@@ -439,6 +454,7 @@ def _collect_fixture_bundle(source: str, db: Session, match_date: Optional[calen
     bundle["fixture_ids"] = fixture_ids
     bundle["unique_fixtures"] = unique_count
     bundle["duplicates_removed"] = max(int(bundle.get("raw_fixtures", 0)) - unique_count, 0)
+    bundle["fixture_enrichment"] = enrich_fixtures(db, fixtures)
     return bundle
 
 
@@ -455,6 +471,8 @@ def _app_status_payload():
             "/healthz",
             "/dates/available",
             "/day-summary",
+            "/debug/enrichment",
+            "/debug/decision-engine/compare",
             "/status",
             "/scrape/today",
             "/fixtures",
@@ -629,6 +647,137 @@ def _serialize_fixture(fixture: Fixture):
         "league": fixture.league,
         "date": str(fixture.date),
         "status": fixture.status,
+    }
+
+
+def _write_enrichment_debug_report(report: dict, requested_date: calendar_date) -> str:
+    output_dir = ARTIFACTS_DIR / "enrichment_debug"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    output_path = output_dir / f"enrichment_debug_{requested_date.isoformat()}_{timestamp}.json"
+    output_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    return output_path.as_posix()
+
+
+def _write_engine_compare_artifact(report: dict, requested_date: calendar_date) -> str:
+    output_dir = ARTIFACTS_DIR / "engine_compare"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    output_path = output_dir / f"engine_compare_{requested_date.isoformat()}_{timestamp}.json"
+    output_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    return output_path.as_posix()
+
+
+def _market_mapping(candidate_market: str) -> tuple[str, str]:
+    key = str(candidate_market or "").strip().lower()
+    if key == "over 1.5":
+        return "Over1.5", "Over 1.5"
+    if key == "over 2.5":
+        return "Over2.5", "Over 2.5"
+    if key == "under 3.5":
+        return "Under3.5", "Under 3.5"
+    if key == "btts":
+        return "BTTS", "BTTS"
+    if key == "home or draw (1x)":
+        return "DoubleChance", "1X"
+    if key == "away or draw (x2)":
+        return "DoubleChance", "X2"
+    return "Preview", str(candidate_market or "Preview")
+
+
+def _calibrated_engine_config() -> CalibrationConfig:
+    min_conf_raw = str(CALIBRATED_ENGINE_MIN_CONFIDENCE or "").strip()
+    min_conf = None
+    if min_conf_raw:
+        try:
+            min_conf = max(min(float(min_conf_raw), 1.0), 0.0)
+        except ValueError:
+            min_conf = None
+    return CalibrationConfig(
+        enabled=bool(ENABLE_CALIBRATED_DECISION_ENGINE),
+        min_market_samples=max(int(CALIBRATED_ENGINE_MIN_MARKET_SAMPLES), 0),
+        min_market_hit_rate=max(min(float(CALIBRATED_ENGINE_MIN_MARKET_HIT_RATE), 1.0), 0.0),
+        suppress_underperforming_markets=bool(CALIBRATED_ENGINE_SUPPRESS_UNDERPERFORMING_MARKETS),
+        underperformance_penalty_scale=max(float(CALIBRATED_ENGINE_UNDERPERFORMANCE_PENALTY_SCALE), 0.0),
+        low_evidence_penalty=max(float(CALIBRATED_ENGINE_LOW_EVIDENCE_PENALTY), 0.0),
+        min_confidence_after_calibration=min_conf,
+    )
+
+
+def _calibrated_engine_picks(db: Session, match_date: Optional[calendar_date], limit: int = 20):
+    resolved_date = _resolve_requested_date(match_date)
+    start, end = _resolve_fixture_window(resolved_date)
+    fixtures = (
+        db.query(Fixture)
+        .filter(Fixture.date >= start, Fixture.date < end, Fixture.status == "scheduled")
+        .order_by(Fixture.date.asc())
+        .all()
+    )
+    if not fixtures:
+        return {"picks": [], "engine_path": "calibrated_engine_no_fixtures", "fallback_reason": "no_scheduled_fixtures"}
+
+    lookback_start = resolved_date - timedelta(days=max(int(CALIBRATED_ENGINE_EVIDENCE_LOOKBACK_DAYS), 1))
+    compare = run_backtest_with_calibration_comparison(
+        db,
+        lookback_start,
+        resolved_date - timedelta(days=1),
+        calibration_config=_calibrated_engine_config(),
+    )
+    evidence = compare.get("market_evidence", {})
+    calibration_config = _calibrated_engine_config()
+
+    enrichment_map = enrich_fixtures(db, fixtures)
+    picks = []
+    skipped = 0
+    for fixture in fixtures:
+        enrichment = enrichment_map.get(fixture.id) or {}
+        fixture_preview = preview_for_enriched_fixture(enrichment)
+        best = select_best_candidate_with_calibration(
+            fixture_preview=fixture_preview,
+            enrichment_completeness=str(enrichment.get("enrichment_completeness", "missing")),
+            config=calibration_config,
+            market_evidence=evidence,
+        )
+        if not best:
+            skipped += 1
+            continue
+
+        market, selection = _market_mapping(str(best.get("candidate_market") or "Preview"))
+        confidence = float(best.get("confidence_score", 0.0) or 0.0)
+        fair_odds = round(1.0 / confidence, 2) if confidence > 0 else None
+        confidence_score = round(confidence * 100, 1)
+        picks.append(
+            {
+                "fixture_id": fixture.id,
+                "match": f"{fixture.home.name} vs {fixture.away.name}" if fixture.home and fixture.away else "Unknown",
+                "league": fixture.league,
+                "date": str(fixture.date),
+                "market": market,
+                "selection": selection,
+                "probability": round(confidence, 3),
+                "market_probability": round(confidence, 3),
+                "edge": round(confidence - 0.5, 3),
+                "fair_odds": fair_odds,
+                "rank_score": confidence_score,
+                "stake": round(max(confidence - 0.45, 0.0) * 10, 2),
+                "confidence": best.get("confidence_band", "low"),
+                "confidence_score": confidence_score,
+                "confidence_grade": _confidence_grade(confidence_score),
+                "odds": None,
+                "expected_home_goals": None,
+                "expected_away_goals": None,
+                "main_reasons": [str(best.get("explanation") or "Calibrated preview selection.")],
+                "risk_notes": [f"enrichment_completeness={enrichment.get('enrichment_completeness', 'missing')}"],
+            }
+        )
+
+    picks.sort(key=lambda item: item["confidence_score"], reverse=True)
+    return {
+        "picks": picks[:limit],
+        "engine_path": "calibrated_engine",
+        "fallback_reason": "insufficient_calibrated_candidates" if (not picks and skipped > 0) else None,
+        "skipped_fixtures": skipped,
+        "evidence_summary": compare.get("comparison", {}),
     }
 
 
@@ -1005,38 +1154,39 @@ def _render_homepage(db: Session):
               linear-gradient(180deg, #fbf7ef 0%, var(--bg) 100%);
           }}
           .wrap {{
-            max-width: 1100px;
+            max-width: 1160px;
             margin: 0 auto;
-            padding: 40px 20px 56px;
+            padding: 18px 14px 28px;
           }}
           .hero {{
             display: grid;
-            gap: 18px;
-            margin-bottom: 30px;
+            gap: 10px;
+            margin-bottom: 16px;
           }}
           .hero h1 {{
             margin: 0;
-            font-size: clamp(2rem, 5vw, 3.4rem);
-            line-height: 0.95;
+            font-size: clamp(1.7rem, 7vw, 2.8rem);
+            line-height: 1.05;
           }}
           .hero p {{
             margin: 0;
             max-width: 760px;
             color: var(--muted);
-            font-size: 1rem;
+            font-size: 0.97rem;
           }}
           .actions {{
             display: flex;
             flex-wrap: wrap;
-            gap: 12px;
+            gap: 8px;
           }}
           .actions a {{
             text-decoration: none;
             color: var(--ink);
-            padding: 12px 16px;
+            padding: 9px 12px;
             border-radius: 999px;
             border: 1px solid var(--line);
             background: rgba(255, 255, 255, 0.72);
+            font-size: 0.9rem;
           }}
           .actions a.primary {{
             background: var(--accent);
@@ -1049,31 +1199,39 @@ def _render_homepage(db: Session):
           }}
           .stats-grid {{
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-            gap: 14px;
-            margin: 28px 0 34px;
+            grid-template-columns: 1fr;
+            gap: 10px;
+            margin: 14px 0 18px;
           }}
           .stat {{
             background: var(--card);
             border: 1px solid var(--line);
-            border-radius: 18px;
-            padding: 18px;
+            border-radius: 14px;
+            padding: 14px 15px;
           }}
           .stat .label {{
             color: var(--muted);
             font-size: 0.9rem;
           }}
           .stat .value {{
-            margin-top: 8px;
-            font-size: 1.9rem;
+            margin-top: 6px;
+            font-size: 1.7rem;
             font-weight: 700;
+          }}
+          section {{
+            background: rgba(255, 255, 255, 0.35);
+            border: 1px solid #e4dbca;
+            border-radius: 18px;
+            padding: 14px;
+            margin-bottom: 14px;
           }}
           .section-head {{
             display: flex;
             justify-content: space-between;
-            align-items: center;
+            align-items: flex-start;
+            flex-direction: column;
             gap: 16px;
-            margin-bottom: 14px;
+            margin-bottom: 10px;
           }}
           .section-head h2 {{
             margin: 0;
@@ -1081,21 +1239,21 @@ def _render_homepage(db: Session):
           }}
           .section-head span {{
             color: var(--muted);
-            font-size: 0.95rem;
+            font-size: 0.88rem;
           }}
           .date-strip {{
-            display: flex;
-            flex-wrap: wrap;
-            gap: 10px;
-            margin-bottom: 22px;
+            display: grid;
+            grid-template-columns: 1fr;
+            gap: 8px;
+            margin-bottom: 10px;
           }}
           .date-pill {{
-            display: inline-flex;
+            display: flex;
             flex-direction: column;
             gap: 2px;
-            min-width: 148px;
-            padding: 12px 14px;
-            border-radius: 16px;
+            min-width: 0;
+            padding: 10px 12px;
+            border-radius: 12px;
             border: 1px solid var(--line);
             background: rgba(255, 255, 255, 0.78);
             color: var(--ink);
@@ -1122,15 +1280,15 @@ def _render_homepage(db: Session):
           }}
           .picks {{
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
-            gap: 16px;
+            grid-template-columns: 1fr;
+            gap: 10px;
           }}
           .pick-card, .empty-card {{
             background: var(--card);
             border: 1px solid var(--line);
-            border-radius: 22px;
-            padding: 18px;
-            box-shadow: 0 18px 30px rgba(23, 34, 31, 0.05);
+            border-radius: 14px;
+            padding: 14px;
+            box-shadow: 0 10px 20px rgba(23, 34, 31, 0.04);
           }}
           .pick-head {{
             display: flex;
@@ -1176,38 +1334,50 @@ def _render_homepage(db: Session):
             font-size: 0.9rem;
           }}
           .toolbar {{
-            display: flex;
-            flex-wrap: wrap;
-            gap: 12px;
-            align-items: center;
-            margin-bottom: 18px;
+            display: grid;
+            grid-template-columns: 1fr;
+            gap: 8px;
+            align-items: stretch;
+            margin-bottom: 10px;
           }}
           .toolbar input[type="date"] {{
-            padding: 12px 14px;
-            border-radius: 12px;
+            width: 100%;
+            padding: 11px 12px;
+            border-radius: 10px;
             border: 1px solid var(--line);
             background: rgba(255, 255, 255, 0.9);
             color: var(--ink);
             font: inherit;
           }}
           .toolbar button {{
-            padding: 12px 16px;
-            border-radius: 12px;
+            width: 100%;
+            padding: 11px 14px;
+            border-radius: 10px;
             border: 1px solid var(--accent);
             background: var(--accent);
             color: white;
+            font-weight: 700;
             font: inherit;
             cursor: pointer;
           }}
-          .toolbar .ghost {{
-            background: transparent;
-            color: var(--ink);
-            border-color: var(--line);
+          .toolbar button:disabled {{ opacity: 0.6; cursor: not-allowed; }}
+          .top-board {{
+            border: 1px solid #d6cebd;
+            background: #fffdf8;
           }}
           .status-line {{
             color: var(--muted);
-            font-size: 0.92rem;
-            margin-bottom: 14px;
+            font-size: 0.88rem;
+            margin-bottom: 8px;
+          }}
+          .muted-link {{
+            border: none;
+            background: transparent;
+            color: var(--muted);
+            padding: 4px 2px;
+            font-size: 0.84rem;
+            text-align: left;
+            cursor: pointer;
           }}
           .hidden {{
             display: none !important;
@@ -1217,8 +1387,18 @@ def _render_homepage(db: Session):
             border-radius: 6px;
             background: #efe8da;
           }}
-          @media (max-width: 640px) {{
-            .wrap {{ padding-top: 28px; }}
+          @media (min-width: 700px) {{
+            .wrap {{ padding: 28px 20px 42px; }}
+            .stats-grid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+            .date-strip {{ grid-template-columns: repeat(3, minmax(0, 1fr)); }}
+            .section-head {{ flex-direction: row; align-items: center; }}
+            .toolbar {{ grid-template-columns: 1fr auto; }}
+            .toolbar button {{ width: auto; min-width: 220px; }}
+            .picks {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+          }}
+          @media (min-width: 1024px) {{
+            .stats-grid {{ grid-template-columns: repeat(4, minmax(0, 1fr)); }}
+            .picks {{ grid-template-columns: repeat(3, minmax(0, 1fr)); }}
           }}
         </style>
       </head>
@@ -1227,9 +1407,9 @@ def _render_homepage(db: Session):
           <section class="hero">
             <h1>Football Prediction Dashboard</h1>
             <p>
-              A lightweight view over the current local database so you can see what was scraped,
-              how much was modeled, and which picks currently rank highest. The page now follows
-              the next available match date automatically and refreshes itself live.
+              Mobile-first live board for fixture coverage, prediction health, and top-ranked picks.
+              Select a date, run the pipeline once, and monitor the strongest outcomes with clean
+              status context in one place.
             </p>
             <div class="actions">
               <a id="top-json-link" class="primary" href="/board?date={today}">Readable Board</a>
@@ -1267,11 +1447,7 @@ def _render_homepage(db: Session):
             </div>
             <div class="toolbar">
               <input id="date-input" type="date" value="{today}" />
-              <button id="load-date-btn" type="button">Load Date</button>
               <button id="run-date-btn" type="button">Run Selected Date</button>
-              <button id="prev-date-btn" class="ghost" type="button">Previous Day</button>
-              <button id="next-date-btn" class="ghost" type="button">Next Day</button>
-              <button id="today-btn" class="ghost" type="button">Today</button>
             </div>
             <p id="status-line" class="status-line">Checking the latest stored fixtures and predictions...</p>
             <div id="date-strip" class="date-strip">
@@ -1280,9 +1456,10 @@ def _render_homepage(db: Session):
                 <p>The dashboard is preparing your available match days.</p>
               </article>
             </div>
+            <button id="toggle-dates-btn" class="muted-link hidden" type="button">View more dates</button>
           </section>
 
-          <section>
+          <section class="top-board">
             <div class="section-head">
               <h2>Top 20 Board</h2>
               <span id="top-picks-caption">Live qualified board for the selected date</span>
@@ -1303,11 +1480,8 @@ def _render_homepage(db: Session):
           const dateStrip = document.getElementById("date-strip");
           const picksNode = document.getElementById("picks");
           const dateInput = document.getElementById("date-input");
-          const loadDateBtn = document.getElementById("load-date-btn");
           const runDateBtn = document.getElementById("run-date-btn");
-          const prevDateBtn = document.getElementById("prev-date-btn");
-          const nextDateBtn = document.getElementById("next-date-btn");
-          const todayBtn = document.getElementById("today-btn");
+          const toggleDatesBtn = document.getElementById("toggle-dates-btn");
           const statusLine = document.getElementById("status-line");
           const currentDateLabel = document.getElementById("current-date-label");
           const topJsonLink = document.getElementById("top-json-link");
@@ -1318,6 +1492,7 @@ def _render_homepage(db: Session):
 
           let currentDate = initialToday;
           let availableDates = initialDates;
+          let datesExpanded = false;
           let refreshHandle = null;
           const autoCollectAttempts = new Set();
           const runInFlightDates = new Set();
@@ -1370,6 +1545,7 @@ def _render_homepage(db: Session):
 
           function renderDateStrip(dateRows) {{
             if (!Array.isArray(dateRows) || dateRows.length === 0) {{
+              toggleDatesBtn.classList.add("hidden");
               dateStrip.innerHTML = `
                 <article class="empty-card">
                   <h3>No stored dates yet</h3>
@@ -1379,7 +1555,12 @@ def _render_homepage(db: Session):
               return;
             }}
 
-            dateStrip.innerHTML = dateRows.map((item) => `
+            const sortedRows = [...dateRows].sort((a, b) => String(b.date).localeCompare(String(a.date)));
+            const visibleRows = datesExpanded ? sortedRows : sortedRows.slice(0, 3);
+            toggleDatesBtn.classList.toggle("hidden", sortedRows.length <= 3);
+            toggleDatesBtn.textContent = datesExpanded ? "Show fewer dates" : `View more (${sortedRows.length - 3} more)`;
+
+            dateStrip.innerHTML = visibleRows.map((item) => `
               <button class="date-pill ${{item.date === currentDate ? "active" : ""}}" type="button" data-date="${{escapeHtml(item.date)}}">
                 <span class="date-label">${{escapeHtml(item.date)}}</span>
                 <span class="date-meta">${{item.fixtures}} fixtures | ${{item.predictions}} predicted</span>
@@ -1396,8 +1577,9 @@ def _render_homepage(db: Session):
               const note = payload?.note ? escapeHtml(payload.note) : "No picks stored for this date yet.";
               picksNode.innerHTML = `
                 <article class="empty-card">
-                  <h3>No picks for ${{escapeHtml(currentDate)}}</h3>
+                  <h3>No ranked picks for ${{escapeHtml(currentDate)}}</h3>
                   <p>${{note}}</p>
+                  <p class="meta">Try running the selected date to refresh fixtures, stats, and predictions for this board.</p>
                 </article>
               `;
               return;
@@ -1430,12 +1612,9 @@ def _render_homepage(db: Session):
           }}
 
           function setBusyState(isBusy) {{
-            loadDateBtn.disabled = isBusy;
             runDateBtn.disabled = isBusy;
-            prevDateBtn.disabled = isBusy;
-            nextDateBtn.disabled = isBusy;
-            todayBtn.disabled = isBusy;
             dateInput.disabled = isBusy;
+            toggleDatesBtn.disabled = isBusy;
           }}
 
           async function refreshDates(preferredDate = null) {{
@@ -1513,24 +1692,6 @@ def _render_homepage(db: Session):
             }}
           }}
 
-          function shiftDate(direction) {{
-            const rows = Array.isArray(availableDates) ? availableDates : [];
-            if (!rows.length) {{
-              return;
-            }}
-            const index = rows.findIndex((item) => item.date === currentDate);
-            if (index === -1) {{
-              const fallbackIndex = direction > 0 ? 0 : rows.length - 1;
-              loadDate(rows[fallbackIndex].date, true);
-              return;
-            }}
-            const nextIndex = index + direction;
-            if (nextIndex < 0 || nextIndex >= rows.length) {{
-              return;
-            }}
-            loadDate(rows[nextIndex].date, true);
-          }}
-
           async function refreshDashboard() {{
             if (refreshInFlight) {{
               return;
@@ -1582,13 +1743,14 @@ def _render_homepage(db: Session):
             }}
           }}
 
-          loadDateBtn.addEventListener("click", () => loadDate(dateInput.value || initialToday, true));
           runDateBtn.addEventListener("click", () => runSelectedDate());
-          prevDateBtn.addEventListener("click", () => shiftDate(-1));
-          nextDateBtn.addEventListener("click", () => shiftDate(1));
-          todayBtn.addEventListener("click", () => loadDate(initialToday, true));
+          toggleDatesBtn.addEventListener("click", () => {{
+            datesExpanded = !datesExpanded;
+            renderDateStrip(availableDates);
+          }});
           dateInput.addEventListener("change", () => {{
             dateInput.value = dateInput.value || currentDate || initialToday;
+            loadDate(dateInput.value, true);
           }});
 
           refreshDashboard();
@@ -2064,6 +2226,78 @@ def get_day_summary(
     return _day_collection_summary(db, match_date, source="stored", min_edge=min_edge, limit=limit)
 
 
+@app.get("/debug/enrichment")
+def debug_fixture_enrichment(
+    source: str = Query("hybrid", description="Source: hybrid, openligadb or footballdata"),
+    match_date: Optional[calendar_date] = Query(None, alias="date", description="Day in YYYY-MM-DD format; defaults to today"),
+    sample_limit: int = Query(200, ge=1, le=1000, description="Maximum enriched fixtures to include in the response"),
+    db: Session = Depends(get_db),
+):
+    requested_date = _resolve_requested_date(match_date)
+    collection_bundle = _collect_fixture_bundle(source, db, match_date=requested_date)
+    enriched_map = collection_bundle.get("fixture_enrichment", {})
+    enriched_rows = list(enriched_map.values())[:sample_limit]
+    summary = summarize_enrichment({row.get("fixture_id"): row for row in enriched_rows if row.get("fixture_id") is not None})
+
+    report = {
+        "mode": "read_only_debug",
+        "requested_date": requested_date.isoformat(),
+        "source": source,
+        "collection": {
+            "raw_fixtures": int(collection_bundle.get("raw_fixtures", 0)),
+            "unique_fixtures": int(collection_bundle.get("unique_fixtures", 0)),
+            "duplicates_removed": int(collection_bundle.get("duplicates_removed", 0)),
+            "source_breakdown": dict(collection_bundle.get("source_breakdown", {})),
+        },
+        "summary": summary,
+        "fixtures": enriched_rows,
+    }
+    report["artifact_path"] = _write_enrichment_debug_report(report, requested_date)
+    return report
+
+
+@app.get("/debug/decision-engine/compare")
+def debug_decision_engine_compare(
+    match_date: Optional[calendar_date] = Query(None, alias="date", description="Day in YYYY-MM-DD format; defaults to today"),
+    limit: int = Query(20, ge=1, le=50),
+    min_edge: float = Query(0.025, ge=0.0, le=1.0),
+    db: Session = Depends(get_db),
+):
+    requested_date = _resolve_requested_date(match_date)
+    resolved_limit = _resolve_limit(limit)
+    resolved_min_edge = _resolve_min_edge(min_edge)
+
+    legacy_pairs = _top_predictions(db, resolved_limit, resolved_min_edge, requested_date)
+    legacy = [_serialize_top_prediction(prediction, details) for prediction, details in legacy_pairs]
+
+    calibrated = _calibrated_engine_picks(db, requested_date, limit=resolved_limit)
+    calibrated_picks = list(calibrated.get("picks", []))
+
+    report = {
+        "mode": "read_only_engine_compare",
+        "requested_date": requested_date.isoformat(),
+        "config": {
+            "enable_calibrated_decision_engine": bool(ENABLE_CALIBRATED_DECISION_ENGINE),
+            "calibrated_engine_min_market_samples": CALIBRATED_ENGINE_MIN_MARKET_SAMPLES,
+            "calibrated_engine_min_market_hit_rate": CALIBRATED_ENGINE_MIN_MARKET_HIT_RATE,
+            "calibrated_engine_suppress_underperforming_markets": bool(CALIBRATED_ENGINE_SUPPRESS_UNDERPERFORMING_MARKETS),
+            "calibrated_engine_evidence_lookback_days": CALIBRATED_ENGINE_EVIDENCE_LOOKBACK_DAYS,
+        },
+        "summary": {
+            "legacy_count": len(legacy),
+            "calibrated_count": len(calibrated_picks),
+            "legacy_avg_confidence_score": round(sum(item.get("confidence_score", 0.0) for item in legacy) / len(legacy), 3) if legacy else 0.0,
+            "calibrated_avg_confidence_score": round(sum(item.get("confidence_score", 0.0) for item in calibrated_picks) / len(calibrated_picks), 3) if calibrated_picks else 0.0,
+            "engine_path": calibrated.get("engine_path", "calibrated_engine"),
+            "fallback_reason": calibrated.get("fallback_reason"),
+        },
+        "legacy_picks": legacy,
+        "calibrated_picks": calibrated_picks,
+    }
+    report["artifact_path"] = _write_engine_compare_artifact(report, requested_date)
+    return report
+
+
 @app.get("/scrape/today", response_model=ScrapeFixturesResponse)
 @app.post("/scrape/today", response_model=ScrapeFixturesResponse)
 def scrape_today_fixtures(
@@ -2268,11 +2502,33 @@ def get_top_predictions(
 ):
     resolved_limit = _resolve_limit(limit)
     resolved_min_edge = _resolve_min_edge(min_edge)
+    engine_path = "legacy_engine"
+    fallback_reason = None
+
+    if ENABLE_CALIBRATED_DECISION_ENGINE:
+        calibrated = _calibrated_engine_picks(db, match_date, limit=resolved_limit)
+        calibrated_picks = calibrated.get("picks", [])
+        if calibrated_picks:
+            logger.info("Top predictions served via calibrated engine path")
+            return {
+                "count": len(calibrated_picks),
+                "requested_date": _requested_date_value(match_date),
+                "note": f"engine_path={calibrated.get('engine_path', 'calibrated_engine')}",
+                "available_dates": _available_date_labels(db, predicted_only=True) if not calibrated_picks else [],
+                "picks": calibrated_picks,
+            }
+        engine_path = "calibrated_engine_fallback_to_legacy"
+        fallback_reason = calibrated.get("fallback_reason") or "no_calibrated_picks"
+        logger.info("Calibrated engine fallback triggered; using legacy top predictions (%s)", fallback_reason)
+
     picks = _top_predictions(db, resolved_limit, resolved_min_edge, match_date)
+    note = _empty_date_note(db, match_date) if not picks else None
+    if engine_path != "legacy_engine":
+        note = f"engine_path={engine_path}; fallback_reason={fallback_reason}" if fallback_reason else f"engine_path={engine_path}"
     return {
         "count": len(picks),
         "requested_date": _requested_date_value(match_date),
-        "note": _empty_date_note(db, match_date) if not picks else None,
+        "note": note,
         "available_dates": _available_date_labels(db, predicted_only=True) if not picks else [],
         "picks": [_serialize_top_prediction(prediction, details) for prediction, details in picks],
     }
