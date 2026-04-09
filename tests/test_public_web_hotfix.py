@@ -14,6 +14,12 @@ from database.models import Fixture
 from utils.browser_assist import BrowserFixtureCandidate
 
 
+def _reset_public_web_state():
+    main._PUBLIC_WEB_BUNDLE_CACHE.clear()
+    main._PUBLIC_WEB_INFLIGHT.clear()
+    main._PUBLIC_WEB_ADAPTER_COOLDOWNS.clear()
+
+
 def _minimal_source_bundle(source_name: str, failed: bool = False) -> dict:
     return {
         "source": source_name,
@@ -84,6 +90,7 @@ def test_hybrid_optional_public_web_failure_stays_fail_open(monkeypatch):
 
 
 def test_public_web_candidate_failure_does_not_rollback_prior_success(monkeypatch):
+    _reset_public_web_state()
     engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
     SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
     Base.metadata.create_all(bind=engine)
@@ -148,3 +155,83 @@ def test_public_web_candidate_failure_does_not_rollback_prior_success(monkeypatc
     assert len(stored) == 2
     assert bundle["source_status"]["public_web"]["survived_unique_fixtures"] == 2
     assert bundle["source_status"]["public_web"]["failed"] is True
+
+
+def test_public_web_bundle_exposes_per_adapter_diagnostics(monkeypatch):
+    _reset_public_web_state()
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+    Base.metadata.create_all(bind=engine)
+    db = SessionLocal()
+
+    class _Adapter:
+        source_name = "test_adapter_diag"
+
+        def discover(self, requested_date, plan):
+            return [
+                BrowserFixtureCandidate(
+                    source_name=self.source_name,
+                    source_url="https://example.com",
+                    competition_name="League A",
+                    match_date=requested_date.isoformat(),
+                    kickoff_time="10:00",
+                    home_team="One FC",
+                    away_team="Two FC",
+                    match_status="scheduled",
+                    extraction_confidence=0.9,
+                )
+            ]
+
+    monkeypatch.setattr(main, "PUBLIC_WEB_ENABLED", True)
+    monkeypatch.setattr(main, "PUBLIC_WEB_ALLOWED_SOURCES", [])
+    monkeypatch.setattr("utils.browser_sources.get_default_browser_adapters", lambda allowed_sources: [_Adapter()])
+
+    bundle = main._collect_public_web_bundle(db, match_date=calendar_date(2026, 4, 9))
+    db.close()
+
+    adapter = bundle["source_status"]["public_web"]["adapters"]["test_adapter_diag"]
+    assert adapter["ran"] is True
+    assert adapter["raw_rows_found"] == 1
+    assert adapter["parsed_fixtures"] == 1
+    assert adapter["persisted_fixtures"] == 1
+
+
+def test_public_web_collection_uses_short_lived_cache(monkeypatch):
+    _reset_public_web_state()
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+    Base.metadata.create_all(bind=engine)
+    db = SessionLocal()
+    calls = {"count": 0}
+
+    class _Adapter:
+        source_name = "test_adapter_cache"
+
+        def discover(self, requested_date, plan):
+            calls["count"] += 1
+            return [
+                BrowserFixtureCandidate(
+                    source_name=self.source_name,
+                    source_url="https://example.com",
+                    competition_name="League A",
+                    match_date=requested_date.isoformat(),
+                    kickoff_time="10:00",
+                    home_team="Cache One FC",
+                    away_team="Cache Two FC",
+                    match_status="scheduled",
+                    extraction_confidence=0.9,
+                )
+            ]
+
+    monkeypatch.setattr(main, "PUBLIC_WEB_ENABLED", True)
+    monkeypatch.setattr(main, "PUBLIC_WEB_ALLOWED_SOURCES", [])
+    monkeypatch.setattr(main, "PUBLIC_WEB_CACHE_TTL_SECONDS", 120)
+    monkeypatch.setattr("utils.browser_sources.get_default_browser_adapters", lambda allowed_sources: [_Adapter()])
+
+    first = main._collect_public_web_bundle(db, match_date=calendar_date(2026, 4, 9))
+    second = main._collect_public_web_bundle(db, match_date=calendar_date(2026, 4, 9))
+    db.close()
+
+    assert calls["count"] == 1
+    assert first["source_status"]["public_web"]["cache_hit"] is False
+    assert second["source_status"]["public_web"]["cache_hit"] is True
