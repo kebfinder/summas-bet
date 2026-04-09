@@ -5,6 +5,7 @@ import time
 
 from fastapi import HTTPException
 from sqlalchemy import create_engine
+from sqlalchemy.orm import Query
 from sqlalchemy.orm import sessionmaker
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -140,10 +141,10 @@ def test_public_web_candidate_failure_does_not_rollback_prior_success(monkeypatc
 
     original_get_or_create = main._get_or_create_team_for_public_web
 
-    def _flaky_get_or_create(session, name, league):
+    def _flaky_get_or_create(session, name, league, resolver=None):
         if name == "Boom FC":
             raise RuntimeError("simulated candidate ingest failure")
-        return original_get_or_create(session, name, league)
+        return original_get_or_create(session, name, league, resolver)
 
     monkeypatch.setattr(main, "PUBLIC_WEB_ENABLED", True)
     monkeypatch.setattr(main, "PUBLIC_WEB_ALLOWED_SOURCES", [])
@@ -281,6 +282,84 @@ def test_public_web_team_identity_matching_reuses_existing_team(monkeypatch):
 
     assert resolved.id == legacy.id
     assert len(teams) == 1
+
+
+def test_public_web_team_identity_matching_does_not_cross_league_merge():
+    _reset_public_web_state()
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+    Base.metadata.create_all(bind=engine)
+    db = SessionLocal()
+
+    legacy = main.Team(name="Atletico Nacional", league="Copa Libertadores")
+    db.add(legacy)
+    db.commit()
+
+    resolved = main._get_or_create_team_for_public_web(db, "Atlético Nacional", "Brasileirão")
+    db.commit()
+    teams = db.query(main.Team).order_by(main.Team.id.asc()).all()
+    db.close()
+
+    assert resolved.id != legacy.id
+    assert len(teams) == 2
+
+
+def test_public_web_ingestion_scans_team_table_once_per_bundle(monkeypatch):
+    _reset_public_web_state()
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+    Base.metadata.create_all(bind=engine)
+    db = SessionLocal()
+
+    class _Adapter:
+        source_name = "test_adapter_perf"
+
+        def discover(self, requested_date, plan):
+            return [
+                BrowserFixtureCandidate(
+                    source_name=self.source_name,
+                    source_url="https://example.com",
+                    competition_name="League A",
+                    match_date=requested_date.isoformat(),
+                    kickoff_time="10:00",
+                    home_team="Atletico Nacional",
+                    away_team="Millonarios FC",
+                    match_status="scheduled",
+                    extraction_confidence=0.9,
+                ),
+                BrowserFixtureCandidate(
+                    source_name=self.source_name,
+                    source_url="https://example.com",
+                    competition_name="League A",
+                    match_date=requested_date.isoformat(),
+                    kickoff_time="12:00",
+                    home_team="Atlético Nacional",
+                    away_team="Santa Fe",
+                    match_status="scheduled",
+                    extraction_confidence=0.9,
+                ),
+            ]
+
+    original_query_all = Query.all
+    team_all_calls = {"count": 0}
+
+    def _counting_all(self):
+        entities = [description.get("entity") for description in self.column_descriptions]
+        if main.Team in entities:
+            team_all_calls["count"] += 1
+        return original_query_all(self)
+
+    monkeypatch.setattr(main, "PUBLIC_WEB_ENABLED", True)
+    monkeypatch.setattr(main, "PUBLIC_WEB_ALLOWED_SOURCES", [])
+    monkeypatch.setattr("utils.browser_sources.get_default_browser_adapters", lambda allowed_sources: [_Adapter()])
+    monkeypatch.setattr(Query, "all", _counting_all)
+
+    try:
+        main._collect_public_web_bundle(db, match_date=calendar_date(2026, 4, 9))
+    finally:
+        db.close()
+
+    assert team_all_calls["count"] == 1
 
 
 def test_public_web_required_success_fails_when_adapter_is_cooling_down(monkeypatch):
