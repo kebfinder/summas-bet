@@ -1,7 +1,10 @@
 import base64
+import copy
 import json
 import logging
 import os
+import threading
+import time
 import sys
 from datetime import date as calendar_date, datetime, timedelta
 from html import escape
@@ -31,6 +34,11 @@ from config import (
     ENABLE_CALIBRATED_DECISION_ENGINE,
     ENABLE_ENGINE_SHADOW_COMPARE_ARTIFACT,
     PUBLIC_WEB_ALLOWED_SOURCES,
+    PUBLIC_WEB_ADAPTER_COOLDOWN_SECONDS,
+    PUBLIC_WEB_ADAPTER_RETRY_ATTEMPTS,
+    PUBLIC_WEB_ADAPTER_RETRY_BACKOFF_SECONDS,
+    PUBLIC_WEB_CACHE_TTL_SECONDS,
+    PUBLIC_WEB_DEDUP_WAIT_SECONDS,
     PUBLIC_WEB_DEFAULT_KICKOFF_TIME,
     PUBLIC_WEB_ENABLED,
     PUBLIC_WEB_REQUIRED_SUCCESS,
@@ -97,6 +105,10 @@ logger = logging.getLogger(__name__)
 APP_VERSION = "1.6.4"
 ARTIFACTS_DIR = Path("artifacts")
 _MARKET_EVIDENCE_CACHE: Dict[Tuple[str, int], Dict[str, dict]] = {}
+_PUBLIC_WEB_BUNDLE_CACHE: Dict[str, tuple[float, dict]] = {}
+_PUBLIC_WEB_INFLIGHT: Dict[str, threading.Event] = {}
+_PUBLIC_WEB_ADAPTER_COOLDOWNS: Dict[str, float] = {}
+_PUBLIC_WEB_CACHE_LOCK = threading.Lock()
 
 SITE_ACCESS_USERNAME = os.getenv("SITE_ACCESS_USERNAME", "").strip()
 SITE_ACCESS_PASSWORD = os.getenv("SITE_ACCESS_PASSWORD", "").strip()
@@ -291,14 +303,52 @@ def _reload_fixtures_by_ids(db: Session, fixture_ids):
 
 
 def _parse_public_web_kickoff(requested_date: calendar_date, kickoff_time: Optional[str]) -> datetime:
+    kickoff_dt, _ = _parse_public_web_kickoff_with_meta(requested_date, kickoff_time)
+    return kickoff_dt
+
+
+def _parse_public_web_kickoff_with_meta(requested_date: calendar_date, kickoff_time: Optional[str]) -> tuple[datetime, bool]:
     raw_time = (kickoff_time or PUBLIC_WEB_DEFAULT_KICKOFF_TIME or "12:00").strip()
+    fallback_used = False
     try:
         hour_str, minute_str = raw_time.split(":", 1)
         hour = max(min(int(hour_str), 23), 0)
         minute = max(min(int(minute_str), 59), 0)
     except Exception:
         hour, minute = 12, 0
-    return datetime.combine(requested_date, datetime.min.time()).replace(hour=hour, minute=minute)
+        fallback_used = True
+    return datetime.combine(requested_date, datetime.min.time()).replace(hour=hour, minute=minute), fallback_used
+
+
+def _public_web_cache_key(requested_date: calendar_date, allowed_sources: tuple[str, ...], days_ahead: int) -> str:
+    allowed = ",".join(sorted(allowed_sources)) if allowed_sources else "ALL"
+    return f"{requested_date.isoformat()}|{days_ahead}|{allowed}|enabled={int(bool(PUBLIC_WEB_ENABLED))}"
+
+
+def _public_web_cached_bundle(cache_key: str) -> Optional[dict]:
+    if PUBLIC_WEB_CACHE_TTL_SECONDS <= 0:
+        return None
+    with _PUBLIC_WEB_CACHE_LOCK:
+        cached = _PUBLIC_WEB_BUNDLE_CACHE.get(cache_key)
+        if not cached:
+            return None
+        cached_at, payload = cached
+        age_seconds = time.time() - cached_at
+        if age_seconds > PUBLIC_WEB_CACHE_TTL_SECONDS:
+            _PUBLIC_WEB_BUNDLE_CACHE.pop(cache_key, None)
+            return None
+        bundle = copy.deepcopy(payload)
+    status = bundle.get("source_status", {}).get("public_web", {})
+    status["cache_hit"] = True
+    status["cache_age_seconds"] = round(age_seconds, 3)
+    return bundle
+
+
+def _store_public_web_cached_bundle(cache_key: str, bundle: dict) -> None:
+    if PUBLIC_WEB_CACHE_TTL_SECONDS <= 0:
+        return
+    with _PUBLIC_WEB_CACHE_LOCK:
+        _PUBLIC_WEB_BUNDLE_CACHE[cache_key] = (time.time(), copy.deepcopy(bundle))
 
 
 def _get_or_create_team_for_public_web(db: Session, name: str, league: Optional[str]) -> Team:
@@ -324,8 +374,33 @@ def _get_or_create_team_for_public_web(db: Session, name: str, league: Optional[
 
 
 def _collect_public_web_bundle(db: Session, match_date: Optional[calendar_date] = None, days_ahead: int = 0):
-    requested_date = _resolve_requested_date(match_date) + timedelta(days=max(int(days_ahead or 0), 0))
+    resolved_days_ahead = max(int(days_ahead or 0), 0)
+    requested_date = _resolve_requested_date(match_date) + timedelta(days=resolved_days_ahead)
     configured_allowed_sources = tuple(source.strip().lower() for source in PUBLIC_WEB_ALLOWED_SOURCES if source.strip())
+    cache_key = _public_web_cache_key(requested_date, configured_allowed_sources, resolved_days_ahead)
+    cached_bundle = _public_web_cached_bundle(cache_key)
+    if cached_bundle is not None:
+        return cached_bundle
+
+    wait_for_other_collector = False
+    inflight_event: Optional[threading.Event] = None
+    with _PUBLIC_WEB_CACHE_LOCK:
+        inflight_event = _PUBLIC_WEB_INFLIGHT.get(cache_key)
+        if inflight_event is None:
+            inflight_event = threading.Event()
+            _PUBLIC_WEB_INFLIGHT[cache_key] = inflight_event
+        else:
+            wait_for_other_collector = True
+
+    if wait_for_other_collector and inflight_event is not None:
+        inflight_event.wait(timeout=max(PUBLIC_WEB_DEDUP_WAIT_SECONDS, 0.1))
+        cached_after_wait = _public_web_cached_bundle(cache_key)
+        if cached_after_wait is not None:
+            status = cached_after_wait.get("source_status", {}).get("public_web", {})
+            status["request_deduped_wait"] = True
+            status["request_dedup_wait_seconds"] = PUBLIC_WEB_DEDUP_WAIT_SECONDS
+            return cached_after_wait
+
     allowlist_active = bool(configured_allowed_sources)
     allowlist_mode = "explicit_allowlist" if allowlist_active else "all_supported_sources"
     base_status = {
@@ -340,161 +415,297 @@ def _collect_public_web_bundle(db: Session, match_date: Optional[calendar_date] 
         "adapter_failures": {},
         "allowlist_mode": allowlist_mode,
         "allowed_sources": list(configured_allowed_sources),
+        "cache_hit": False,
+        "cache_ttl_seconds": PUBLIC_WEB_CACHE_TTL_SECONDS,
+        "request_deduped_wait": False,
+        "adapters": {},
     }
-    if not PUBLIC_WEB_ENABLED:
-        base_status["failure_reason"] = "PUBLIC_WEB_ENABLED is false"
-        return {
-            "source": "public_web",
-            "source_breakdown": {"public_web": 0},
-            "raw_fixtures": 0,
-            "fixtures": [],
-            "source_status": {"public_web": base_status},
-            "note": "public_web is disabled by config.",
-        }
-
-    from utils.browser_assist import BrowserAssistPlan
-    from utils.browser_sources import get_default_browser_adapters
-
-    adapters = get_default_browser_adapters(configured_allowed_sources)
-    if not adapters:
-        base_status.update(
-            {
-                "ran": True,
-                "failed": True,
-                "failure_reason": (
-                    "No public_web adapters matched PUBLIC_WEB_ALLOWED_SOURCES."
-                    if allowlist_active
-                    else "No public_web adapters are currently implemented in this build."
-                ),
+    try:
+        if not PUBLIC_WEB_ENABLED:
+            base_status["failure_reason"] = "PUBLIC_WEB_ENABLED is false"
+            result = {
+                "source": "public_web",
+                "source_breakdown": {"public_web": 0},
+                "raw_fixtures": 0,
+                "fixtures": [],
+                "source_status": {"public_web": base_status},
+                "note": "public_web is disabled by config.",
             }
+            _store_public_web_cached_bundle(cache_key, result)
+            return result
+
+        from utils.browser_assist import BrowserAssistPlan
+        from utils.browser_sources import get_default_browser_adapters
+
+        adapters = get_default_browser_adapters(configured_allowed_sources)
+        if not adapters:
+            base_status.update(
+                {
+                    "ran": True,
+                    "failed": True,
+                    "failure_reason": (
+                        "No public_web adapters matched PUBLIC_WEB_ALLOWED_SOURCES."
+                        if allowlist_active
+                        else "No public_web adapters are currently implemented in this build."
+                    ),
+                }
+            )
+            result = {
+                "source": "public_web",
+                "source_breakdown": {"public_web": 0},
+                "raw_fixtures": 0,
+                "fixtures": [],
+                "source_status": {"public_web": base_status},
+                "note": base_status["failure_reason"],
+            }
+            _store_public_web_cached_bundle(cache_key, result)
+            return result
+
+        plan = BrowserAssistPlan(
+            requested_date=requested_date.isoformat(),
+            coverage_status="debug",
+            trigger_eligible=True,
+            trigger_reasons=(),
+            adapters_configured=tuple(adapter.source_name for adapter in adapters),
+            target_fixture_count=0,
+            target_analyzable_count=0,
+            min_active_leagues=0,
+            note="public_web direct collection",
         )
-        return {
-            "source": "public_web",
-            "source_breakdown": {"public_web": 0},
-            "raw_fixtures": 0,
-            "fixtures": [],
-            "source_status": {"public_web": base_status},
-            "note": base_status["failure_reason"],
-        }
 
-    plan = BrowserAssistPlan(
-        requested_date=requested_date.isoformat(),
-        coverage_status="debug",
-        trigger_eligible=True,
-        trigger_reasons=(),
-        adapters_configured=tuple(adapter.source_name for adapter in adapters),
-        target_fixture_count=0,
-        target_analyzable_count=0,
-        min_active_leagues=0,
-        note="public_web direct collection",
-    )
+        fixture_ids: list[int] = []
+        raw_candidates = 0
+        failures: dict[str, str] = {}
+        fixture_source_index: dict[int, str] = {}
+        kickoff_fallback_fixtures: list[int] = []
 
-    fixture_ids: list[int] = []
-    raw_candidates = 0
-    failures: dict[str, str] = {}
-
-    for adapter in adapters:
-        try:
-            discovered = adapter.discover(requested_date, plan) or []
-        except Exception as exc:
-            failures[adapter.source_name] = str(exc)
-            logger.warning("public_web adapter %s failed for %s: %s", adapter.source_name, requested_date.isoformat(), exc)
-            continue
-
-        raw_candidates += len(discovered)
-        for candidate in discovered:
-            home_name = normalize_team_name(candidate.home_team)
-            away_name = normalize_team_name(candidate.away_team)
-            if not home_name or not away_name or home_name == away_name:
+        for adapter in adapters:
+            adapter_status = {
+                "enabled": True,
+                "skipped": False,
+                "skip_reason": None,
+                "ran": False,
+                "raw_rows_found": 0,
+                "parsed_fixtures": 0,
+                "deduplicated_away_count": 0,
+                "persisted_fixtures": 0,
+                "analyzable_fixtures": 0,
+                "predicted_fixtures": 0,
+                "failed": False,
+                "failure_reason": None,
+                "retry_attempts": 0,
+                "cooldown_active": False,
+                "cooldown_remaining_seconds": 0,
+            }
+            base_status["adapters"][adapter.source_name] = adapter_status
+            cooldown_until = _PUBLIC_WEB_ADAPTER_COOLDOWNS.get(adapter.source_name, 0)
+            now_ts = time.time()
+            if cooldown_until > now_ts:
+                adapter_status.update(
+                    {
+                        "skipped": True,
+                        "skip_reason": "adapter_cooldown_active",
+                        "cooldown_active": True,
+                        "cooldown_remaining_seconds": int(max(cooldown_until - now_ts, 0)),
+                    }
+                )
                 continue
 
-            competition = resolve_competition("storage", name=candidate.competition_name)
-            league_name = (
-                competition.display_name
-                if competition
-                else (candidate.competition_name or "Public Web")
-            )
-            kickoff_dt = _parse_public_web_kickoff(requested_date, candidate.kickoff_time)
-            day_start = datetime.combine(requested_date, datetime.min.time())
-            day_end = day_start + timedelta(days=1)
-
-            try:
-                with db.begin_nested():
-                    home_team = _get_or_create_team_for_public_web(db, home_name, league_name)
-                    away_team = _get_or_create_team_for_public_web(db, away_name, league_name)
-
-                    existing = (
-                        db.query(Fixture)
-                        .filter(
-                            Fixture.home_id == home_team.id,
-                            Fixture.away_id == away_team.id,
-                            Fixture.date >= day_start,
-                            Fixture.date < day_end,
+            discovered = []
+            attempts = max(PUBLIC_WEB_ADAPTER_RETRY_ATTEMPTS, 1)
+            for attempt in range(1, attempts + 1):
+                adapter_status["retry_attempts"] = attempt
+                try:
+                    discovered = adapter.discover(requested_date, plan) or []
+                    adapter_status["ran"] = True
+                    _PUBLIC_WEB_ADAPTER_COOLDOWNS.pop(adapter.source_name, None)
+                    break
+                except Exception as exc:
+                    adapter_status["failure_reason"] = str(exc)
+                    if attempt >= attempts:
+                        failures[adapter.source_name] = str(exc)
+                        adapter_status["failed"] = True
+                        cooldown_seconds = max(PUBLIC_WEB_ADAPTER_COOLDOWN_SECONDS, 0)
+                        if cooldown_seconds:
+                            _PUBLIC_WEB_ADAPTER_COOLDOWNS[adapter.source_name] = time.time() + cooldown_seconds
+                            adapter_status["cooldown_active"] = True
+                            adapter_status["cooldown_remaining_seconds"] = cooldown_seconds
+                        logger.warning("public_web adapter %s failed for %s: %s", adapter.source_name, requested_date.isoformat(), exc)
+                    else:
+                        sleep_seconds = PUBLIC_WEB_ADAPTER_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1))
+                        logger.warning(
+                            "public_web adapter %s retry %s/%s after failure: %s",
+                            adapter.source_name,
+                            attempt,
+                            attempts,
+                            exc,
                         )
-                        .first()
-                    )
-                    if existing:
-                        existing.date = kickoff_dt
-                        existing.status = normalize_status(candidate.match_status, is_finished=False)
-                        if not existing.league or existing.league == "Unknown":
-                            existing.league = league_name
+                        if sleep_seconds > 0:
+                            time.sleep(sleep_seconds)
+
+            adapter_status["raw_rows_found"] = len(discovered)
+            raw_candidates += len(discovered)
+            persisted_ids_for_adapter: list[int] = []
+            for candidate in discovered:
+                home_name = normalize_team_name(candidate.home_team)
+                away_name = normalize_team_name(candidate.away_team)
+                if not home_name or not away_name or home_name == away_name:
+                    continue
+                adapter_status["parsed_fixtures"] += 1
+
+                competition = resolve_competition("storage", name=candidate.competition_name)
+                league_name = (
+                    competition.display_name
+                    if competition
+                    else (candidate.competition_name or "Public Web")
+                )
+                kickoff_dt, kickoff_fallback_used = _parse_public_web_kickoff_with_meta(requested_date, candidate.kickoff_time)
+                day_start = datetime.combine(requested_date, datetime.min.time())
+                day_end = day_start + timedelta(days=1)
+
+                try:
+                    with db.begin_nested():
+                        home_team = _get_or_create_team_for_public_web(db, home_name, league_name)
+                        away_team = _get_or_create_team_for_public_web(db, away_name, league_name)
+
+                        existing = (
+                            db.query(Fixture)
+                            .filter(
+                                Fixture.home_id == home_team.id,
+                                Fixture.away_id == away_team.id,
+                                Fixture.date >= day_start,
+                                Fixture.date < day_end,
+                            )
+                            .first()
+                        )
+                        if existing:
+                            existing.date = kickoff_dt
+                            existing.status = normalize_status(candidate.match_status, is_finished=False)
+                            if not existing.league or existing.league == "Unknown":
+                                existing.league = league_name
+                            db.flush()
+                            fixture_ids.append(existing.id)
+                            if existing.id is not None:
+                                fixture_source_index[existing.id] = adapter.source_name
+                                persisted_ids_for_adapter.append(existing.id)
+                                if kickoff_fallback_used:
+                                    kickoff_fallback_fixtures.append(existing.id)
+                            continue
+
+                        fixture = Fixture(
+                            date=kickoff_dt,
+                            home_id=home_team.id,
+                            away_id=away_team.id,
+                            league=league_name,
+                            status=normalize_status(candidate.match_status, is_finished=False),
+                        )
+                        db.add(fixture)
                         db.flush()
-                        fixture_ids.append(existing.id)
-                        continue
+                        if fixture.id is not None:
+                            fixture_ids.append(fixture.id)
+                            fixture_source_index[fixture.id] = adapter.source_name
+                            persisted_ids_for_adapter.append(fixture.id)
+                            if kickoff_fallback_used:
+                                kickoff_fallback_fixtures.append(fixture.id)
+                except Exception as exc:
+                    failures[adapter.source_name] = str(exc)
+                    adapter_status["failed"] = True
+                    adapter_status["failure_reason"] = str(exc)
+                    logger.warning("public_web candidate ingest failed (%s): %s", adapter.source_name, exc)
+            persisted_unique = sorted(set(persisted_ids_for_adapter))
+            adapter_status["persisted_fixtures"] = len(persisted_unique)
+            adapter_status["deduplicated_away_count"] = max(
+                int(adapter_status["parsed_fixtures"]) - len(persisted_unique),
+                0,
+            )
 
-                    fixture = Fixture(
-                        date=kickoff_dt,
-                        home_id=home_team.id,
-                        away_id=away_team.id,
-                        league=league_name,
-                        status=normalize_status(candidate.match_status, is_finished=False),
-                    )
-                    db.add(fixture)
-                    db.flush()
-                    if fixture.id is not None:
-                        fixture_ids.append(fixture.id)
-            except Exception as exc:
-                failures[adapter.source_name] = str(exc)
-                logger.warning("public_web candidate ingest failed (%s): %s", adapter.source_name, exc)
+        try:
+            db.commit()
+        except Exception as exc:
+            db.rollback()
+            failures["commit"] = str(exc)
 
-    try:
-        db.commit()
-    except Exception as exc:
-        db.rollback()
-        failures["commit"] = str(exc)
+        unique_ids = sorted(set(fixture_ids))
+        stored_fixtures = _reload_fixtures_by_ids(db, unique_ids)
+        source_fixture_ids: dict[str, set[int]] = {}
+        for fixture in stored_fixtures:
+            source_name = fixture_source_index.get(fixture.id)
+            if source_name:
+                source_fixture_ids.setdefault(source_name, set()).add(fixture.id)
 
-    unique_ids = sorted(set(fixture_ids))
-    status = dict(base_status)
-    status.update(
-        {
-            "ran": True,
+        for source_name, fixture_id_set in source_fixture_ids.items():
+            adapter_status = base_status["adapters"].get(source_name)
+            if not adapter_status:
+                continue
+            fixture_list = [fixture for fixture in stored_fixtures if fixture.id in fixture_id_set]
+            analyzable_count = 0
+            predicted_count = 0
+            for fixture in fixture_list:
+                if fixture.status != "scheduled":
+                    continue
+                context = build_match_context(db, fixture)
+                if context["data_quality"] >= 0.42:
+                    analyzable_count += 1
+                if db.query(Prediction.id).filter(Prediction.fixture_id == fixture.id).first():
+                    predicted_count += 1
+            adapter_status["analyzable_fixtures"] = analyzable_count
+            adapter_status["predicted_fixtures"] = predicted_count
+
+        status = dict(base_status)
+        status.update(
+            {
+                "ran": True,
+                "raw_fixtures": int(raw_candidates),
+                "survived_unique_fixtures": len(unique_ids),
+                "duplicates_removed": max(raw_candidates - len(unique_ids), 0),
+                "failed": bool(failures),
+                "failure_reason": "; ".join(f"{k}: {v}" for k, v in failures.items()) if failures else None,
+                "adapter_failures": failures,
+                "kickoff_parse_fallback_count": len(set(kickoff_fallback_fixtures)),
+            }
+        )
+        for adapter_name, adapter_status in sorted(status.get("adapters", {}).items()):
+            logger.info(
+                "public_web adapter=%s enabled=%s skipped=%s ran=%s raw=%s parsed=%s dedupe_away=%s persisted=%s analyzable=%s predicted=%s failed=%s reason=%s",
+                adapter_name,
+                adapter_status.get("enabled"),
+                adapter_status.get("skipped"),
+                adapter_status.get("ran"),
+                adapter_status.get("raw_rows_found"),
+                adapter_status.get("parsed_fixtures"),
+                adapter_status.get("deduplicated_away_count"),
+                adapter_status.get("persisted_fixtures"),
+                adapter_status.get("analyzable_fixtures"),
+                adapter_status.get("predicted_fixtures"),
+                adapter_status.get("failed"),
+                adapter_status.get("failure_reason"),
+            )
+        logger.info(
+            "public_web collection %s | mode=%s allowed=%s raw=%s unique=%s dedupe_removed=%s failed=%s reason=%s",
+            requested_date.isoformat(),
+            allowlist_mode,
+            ",".join(configured_allowed_sources) if configured_allowed_sources else "ALL",
+            status["raw_fixtures"],
+            status["survived_unique_fixtures"],
+            status["duplicates_removed"],
+            status["failed"],
+            status["failure_reason"],
+        )
+        result = {
+            "source": "public_web",
+            "source_breakdown": {"public_web": len(unique_ids)},
             "raw_fixtures": int(raw_candidates),
-            "survived_unique_fixtures": len(unique_ids),
-            "duplicates_removed": max(raw_candidates - len(unique_ids), 0),
-            "failed": bool(failures),
-            "failure_reason": "; ".join(f"{k}: {v}" for k, v in failures.items()) if failures else None,
-            "adapter_failures": failures,
+            "fixtures": stored_fixtures,
+            "source_status": {"public_web": status},
+            "note": None if not failures else f"public_web partial failure: {status['failure_reason']}",
         }
-    )
-    logger.info(
-        "public_web collection %s | mode=%s allowed=%s raw=%s unique=%s dedupe_removed=%s failed=%s reason=%s",
-        requested_date.isoformat(),
-        allowlist_mode,
-        ",".join(configured_allowed_sources) if configured_allowed_sources else "ALL",
-        status["raw_fixtures"],
-        status["survived_unique_fixtures"],
-        status["duplicates_removed"],
-        status["failed"],
-        status["failure_reason"],
-    )
-    return {
-        "source": "public_web",
-        "source_breakdown": {"public_web": len(unique_ids)},
-        "raw_fixtures": int(raw_candidates),
-        "fixtures": _reload_fixtures_by_ids(db, unique_ids),
-        "source_status": {"public_web": status},
-        "note": None if not failures else f"public_web partial failure: {status['failure_reason']}",
-    }
+        _store_public_web_cached_bundle(cache_key, result)
+        return result
+    finally:
+        with _PUBLIC_WEB_CACHE_LOCK:
+            active_event = _PUBLIC_WEB_INFLIGHT.pop(cache_key, None)
+            if active_event is not None:
+                active_event.set()
 
 
 def _public_web_failure_bundle(match_date: Optional[calendar_date], reason: str) -> dict:
@@ -518,6 +729,10 @@ def _public_web_failure_bundle(match_date: Optional[calendar_date], reason: str)
                 "failure_reason": safe_reason,
                 "allowlist_mode": "explicit_allowlist" if allowlist_active else "all_supported_sources",
                 "allowed_sources": list(configured_allowed_sources),
+                "cache_hit": False,
+                "cache_ttl_seconds": PUBLIC_WEB_CACHE_TTL_SECONDS,
+                "request_deduped_wait": False,
+                "adapters": {},
             }
         },
         "note": f"public_web failed safely: {safe_reason}",
@@ -1556,6 +1771,54 @@ def _day_collection_summary(
         "qualified_markets": qualified_markets,
         "ranked_picks": ranked_picks,
         "source_breakdown": source_breakdown,
+    }
+
+
+def _fixture_analyzability_diagnostic(db: Session, fixture: Fixture, enrichment: Optional[dict] = None) -> dict:
+    reasons: list[str] = []
+    if fixture.status != "scheduled":
+        reasons.append("fixture_not_scheduled")
+
+    competition = competition_profile_for_name(fixture.league)
+    if competition.get("experimental"):
+        reasons.append("competition_mapping_gap_or_experimental")
+    if float(competition.get("admission_score", 0.0) or 0.0) < 0.62:
+        reasons.append("unsupported_adapter_or_competition_coverage")
+
+    home_name = getattr(getattr(fixture, "home", None), "name", None)
+    away_name = getattr(getattr(fixture, "away", None), "name", None)
+    if normalize_team_name(home_name) == normalize_team_name(away_name):
+        reasons.append("team_normalization_mismatch")
+
+    context = build_match_context(db, fixture)
+    if context["data_quality"] < 0.42:
+        reasons.append("missing_stats_or_history")
+        if context.get("sample_support", 0) < 0.45:
+            reasons.append("missing_recent_team_history")
+        if context.get("league_support", 0) < 0.45:
+            reasons.append("missing_league_history")
+
+    if enrichment is None:
+        enrichment = enrich_fixtures(db, [fixture]).get(fixture.id or -1, {})
+    missing_fields = list(enrichment.get("missing_fields", []))
+    if missing_fields:
+        reasons.append("missing_enrichment_fields")
+
+    unique_reasons = sorted(set(reasons))
+    analyzable = fixture.status == "scheduled" and context["data_quality"] >= 0.42
+    return {
+        "fixture_id": fixture.id,
+        "match": f"{home_name or 'Unknown'} vs {away_name or 'Unknown'}",
+        "league": fixture.league,
+        "kickoff": fixture.date.isoformat() if fixture.date else None,
+        "analyzable": analyzable,
+        "data_quality": context["data_quality"],
+        "sample_support": context.get("sample_support"),
+        "league_support": context.get("league_support"),
+        "venue_support": context.get("venue_support"),
+        "enrichment_completeness": enrichment.get("enrichment_completeness", "missing"),
+        "missing_fields": missing_fields,
+        "reasons": unique_reasons if unique_reasons else ["analyzable"],
     }
 
 
@@ -2804,6 +3067,53 @@ def debug_source_status(
         },
         "sources": probes,
         "next_step": f"GET /debug/sources/status?date={requested_date.isoformat()}",
+    }
+
+
+@app.get("/debug/public-web/diagnostics")
+def debug_public_web_diagnostics(
+    match_date: Optional[calendar_date] = Query(None, alias="date", description="Day in YYYY-MM-DD format; defaults to today"),
+    sample_limit: int = Query(200, ge=1, le=1000),
+    db: Session = Depends(get_db),
+):
+    requested_date = _resolve_requested_date(match_date)
+    bundle = _collect_fixture_bundle("public_web", db, match_date=requested_date)
+    fixtures = list(bundle.get("fixtures", []))
+    enrichment_map = bundle.get("fixture_enrichment", {})
+    diagnostics = [
+        _fixture_analyzability_diagnostic(db, fixture, enrichment=enrichment_map.get(fixture.id))
+        for fixture in fixtures[:sample_limit]
+        if fixture is not None
+    ]
+    reason_counts: Dict[str, int] = {}
+    for row in diagnostics:
+        for reason in row.get("reasons", []):
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+
+    not_analyzable = [row for row in diagnostics if not row.get("analyzable")]
+    analyzable = [row for row in diagnostics if row.get("analyzable")]
+    return {
+        "mode": "read_only_debug",
+        "requested_date": requested_date.isoformat(),
+        "collection": {
+            "raw_fixtures": int(bundle.get("raw_fixtures", 0)),
+            "unique_fixtures": int(bundle.get("unique_fixtures", 0)),
+            "duplicates_removed": int(bundle.get("duplicates_removed", 0)),
+            "source_breakdown": dict(bundle.get("source_breakdown", {})),
+            "source_status": bundle.get("source_status", {}),
+        },
+        "summary": {
+            "fixtures_inspected": len(diagnostics),
+            "analyzable_fixtures": len(analyzable),
+            "not_analyzable_fixtures": len(not_analyzable),
+            "top_not_analyzable_reasons": [
+                {"reason": reason, "count": count}
+                for reason, count in sorted(reason_counts.items(), key=lambda item: item[1], reverse=True)
+                if reason != "analyzable"
+            ][:10],
+        },
+        "fixtures": diagnostics,
+        "next_step": f"GET /debug/public-web/diagnostics?date={requested_date.isoformat()}",
     }
 
 

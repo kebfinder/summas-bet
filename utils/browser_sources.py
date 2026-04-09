@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import html
+import json
 import logging
 import re
 from datetime import date as calendar_date
+from datetime import datetime
 
 import requests
 
@@ -54,7 +56,10 @@ class ConmebolLibertadoresAdapter:
             return []
 
         lines = self._extract_lines(response.text)
-        return self._extract_candidates(lines, requested_date, url)
+        candidates = self._extract_candidates(lines, requested_date, url)
+        if candidates:
+            return candidates
+        return self._extract_candidates_from_json_ld(response.text, requested_date, url)
 
     def _extract_lines(self, raw_html: str) -> list[str]:
         text = re.sub(r"(?i)<br\s*/?>", "\n", raw_html)
@@ -106,6 +111,71 @@ class ConmebolLibertadoresAdapter:
             )
 
         return candidates
+
+    def _extract_candidates_from_json_ld(self, raw_html: str, requested_date: calendar_date, url: str):
+        candidates: list[BrowserFixtureCandidate] = []
+        script_pattern = re.compile(
+            r"<script[^>]*type=[\"']application/ld\+json[\"'][^>]*>(.*?)</script>",
+            re.IGNORECASE | re.DOTALL,
+        )
+        for match in script_pattern.finditer(raw_html):
+            payload = html.unescape(match.group(1) or "").strip()
+            if not payload:
+                continue
+            try:
+                json_payload = json.loads(payload)
+            except Exception:
+                continue
+            items = json_payload if isinstance(json_payload, list) else [json_payload]
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("@type", "")).lower() not in {"sportsevent", "event"}:
+                    continue
+                start_date = str(item.get("startDate") or "").strip()
+                if not start_date:
+                    continue
+                kickoff_dt = self._parse_event_datetime(start_date)
+                if not kickoff_dt or kickoff_dt.date() != requested_date:
+                    continue
+                home_team = self._participant_name(item.get("homeTeam"))
+                away_team = self._participant_name(item.get("awayTeam"))
+                if not home_team or not away_team:
+                    continue
+                candidates.append(
+                    BrowserFixtureCandidate(
+                        source_name=self.source_name,
+                        source_url=url,
+                        competition_name="Copa Libertadores",
+                        match_date=requested_date.isoformat(),
+                        kickoff_time=kickoff_dt.strftime("%H:%M"),
+                        home_team=home_team,
+                        away_team=away_team,
+                        match_status="scheduled",
+                        extraction_confidence=0.93,
+                        stage_name=str(item.get("description") or item.get("name") or "").strip() or None,
+                    )
+                )
+        return candidates
+
+    @staticmethod
+    def _participant_name(value):
+        if isinstance(value, dict):
+            return str(value.get("name") or "").strip()
+        if isinstance(value, str):
+            return value.strip()
+        return ""
+
+    @staticmethod
+    def _parse_event_datetime(value: str) -> datetime | None:
+        raw = str(value or "").strip()
+        if not raw:
+            return None
+        normalized = raw.replace("Z", "+00:00")
+        try:
+            return datetime.fromisoformat(normalized)
+        except Exception:
+            return None
 
 
 def get_default_browser_adapters(allowed_sources: tuple[str, ...] = ()) -> list[BrowserSourceAdapter]:
