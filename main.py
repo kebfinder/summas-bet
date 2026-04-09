@@ -1658,7 +1658,7 @@ def _render_homepage(db: Session):
             const sortedRows = [...dateRows].sort((a, b) => String(b.date).localeCompare(String(a.date)));
             const visibleRows = datesExpanded ? sortedRows : sortedRows.slice(0, 3);
             toggleDatesBtn.classList.toggle("hidden", sortedRows.length <= 3);
-            toggleDatesBtn.textContent = datesExpanded ? "Show fewer dates" : `View more (${sortedRows.length - 3} more)`;
+            toggleDatesBtn.textContent = datesExpanded ? "Show fewer dates" : `View more (${{sortedRows.length - 3}} more)`;
 
             dateStrip.innerHTML = visibleRows.map((item) => `
               <button class="date-pill ${{item.date === currentDate ? "active" : ""}}" type="button" data-date="${{escapeHtml(item.date)}}">
