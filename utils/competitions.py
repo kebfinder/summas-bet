@@ -704,6 +704,19 @@ COMPETITION_REGISTRY: tuple[CompetitionDefinition, ...] = (
         },
     ),
     CompetitionDefinition(
+        canonical_id="copa_sudamericana",
+        display_name="Copa Sudamericana",
+        competition_class="continental_club",
+        country="South America",
+        collection_tier="expansion",
+        preferred_rank=15,
+        source_confidence={"footballdata": 0.86},
+        provider_aliases={
+            "footballdata": {"codes": ("CSA",), "names": ("copa sudamericana", "conmebol sudamericana")},
+            "storage": {"names": ("copa sudamericana", "conmebol sudamericana")},
+        },
+    ),
+    CompetitionDefinition(
         canonical_id="jupiler_pro_league",
         display_name="Belgian Pro League",
         competition_class="secondary_domestic",
