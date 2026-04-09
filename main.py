@@ -16,6 +16,7 @@ from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.orm import Session
 
 from config import (
+    CALIBRATED_DECISION_ENGINE_MODE,
     CALIBRATED_ENGINE_EVIDENCE_LOOKBACK_DAYS,
     CALIBRATED_ENGINE_LOW_EVIDENCE_PENALTY,
     CALIBRATED_ENGINE_MIN_CONFIDENCE,
@@ -28,6 +29,7 @@ from config import (
     DEFAULT_FOOTBALLDATA_PRODUCTION_CODES,
     FOOTBALLDATA_TARGET_FIXTURE_COUNT,
     ENABLE_CALIBRATED_DECISION_ENGINE,
+    ENABLE_ENGINE_SHADOW_COMPARE_ARTIFACT,
 )
 from database.database import Base, engine, get_db
 from database.models import Fixture, HistoricalMatch, Prediction, Team
@@ -472,6 +474,7 @@ def _app_status_payload():
             "/dates/available",
             "/day-summary",
             "/debug/enrichment",
+            "/debug/decision-engine/mode",
             "/debug/decision-engine/compare",
             "/status",
             "/scrape/today",
@@ -704,6 +707,15 @@ def _calibrated_engine_config() -> CalibrationConfig:
     )
 
 
+def _resolved_decision_engine_mode() -> str:
+    explicit_mode = str(CALIBRATED_DECISION_ENGINE_MODE or "").strip().lower()
+    if explicit_mode in {"active", "shadow"}:
+        return explicit_mode
+    if ENABLE_CALIBRATED_DECISION_ENGINE:
+        return "active"
+    return "legacy"
+
+
 def _calibrated_engine_picks(db: Session, match_date: Optional[calendar_date], limit: int = 20):
     resolved_date = _resolve_requested_date(match_date)
     start, end = _resolve_fixture_window(resolved_date)
@@ -779,6 +791,35 @@ def _calibrated_engine_picks(db: Session, match_date: Optional[calendar_date], l
         "skipped_fixtures": skipped,
         "evidence_summary": compare.get("comparison", {}),
     }
+
+
+def _shadow_engine_comparison(
+    db: Session,
+    match_date: Optional[calendar_date],
+    legacy_count: int,
+    calibrated: Optional[dict] = None,
+) -> dict:
+    calibrated_result = calibrated or {}
+    calibrated_picks = calibrated_result.get("picks", []) if isinstance(calibrated_result, dict) else []
+    if calibrated_result and calibrated_picks:
+        status = "available"
+    elif calibrated_result and calibrated_result.get("fallback_reason"):
+        status = "empty"
+    else:
+        status = "unavailable"
+    report = {
+        "date": _requested_date_value(match_date),
+        "engine_mode": "shadow",
+        "legacy_count": int(legacy_count),
+        "calibrated_count": len(calibrated_picks),
+        "shadow_status": status,
+        "calibrated_engine_path": calibrated_result.get("engine_path"),
+        "calibrated_fallback_reason": calibrated_result.get("fallback_reason"),
+    }
+    if ENABLE_ENGINE_SHADOW_COMPARE_ARTIFACT:
+        resolved_date = _resolve_requested_date(match_date)
+        report["artifact_path"] = _write_engine_compare_artifact(report, resolved_date)
+    return report
 
 
 def _competition_flags(league_name: Optional[str]) -> dict:
@@ -2298,6 +2339,25 @@ def debug_decision_engine_compare(
     return report
 
 
+@app.get("/debug/decision-engine/mode")
+def debug_decision_engine_mode():
+    mode = _resolved_decision_engine_mode()
+    return {
+        "mode": mode,
+        "legacy_default": mode == "legacy",
+        "config": {
+            "CALIBRATED_DECISION_ENGINE_MODE": CALIBRATED_DECISION_ENGINE_MODE,
+            "ENABLE_CALIBRATED_DECISION_ENGINE": bool(ENABLE_CALIBRATED_DECISION_ENGINE),
+            "ENABLE_ENGINE_SHADOW_COMPARE_ARTIFACT": bool(ENABLE_ENGINE_SHADOW_COMPARE_ARTIFACT),
+        },
+        "paths": {
+            "legacy": "Legacy engine only.",
+            "shadow": "Legacy output with calibrated comparison metadata only.",
+            "active": "Calibrated output with fallback to legacy if needed.",
+        },
+    }
+
+
 @app.get("/scrape/today", response_model=ScrapeFixturesResponse)
 @app.post("/scrape/today", response_model=ScrapeFixturesResponse)
 def scrape_today_fixtures(
@@ -2502,10 +2562,11 @@ def get_top_predictions(
 ):
     resolved_limit = _resolve_limit(limit)
     resolved_min_edge = _resolve_min_edge(min_edge)
+    engine_mode = _resolved_decision_engine_mode()
     engine_path = "legacy_engine"
     fallback_reason = None
 
-    if ENABLE_CALIBRATED_DECISION_ENGINE:
+    if engine_mode == "active":
         calibrated = _calibrated_engine_picks(db, match_date, limit=resolved_limit)
         calibrated_picks = calibrated.get("picks", [])
         if calibrated_picks:
@@ -2513,7 +2574,10 @@ def get_top_predictions(
             return {
                 "count": len(calibrated_picks),
                 "requested_date": _requested_date_value(match_date),
-                "note": f"engine_path={calibrated.get('engine_path', 'calibrated_engine')}",
+                "note": (
+                    f"engine_mode={engine_mode}; "
+                    f"engine_path={calibrated.get('engine_path', 'calibrated_engine')}"
+                ),
                 "available_dates": _available_date_labels(db, predicted_only=True) if not calibrated_picks else [],
                 "picks": calibrated_picks,
             }
@@ -2523,8 +2587,37 @@ def get_top_predictions(
 
     picks = _top_predictions(db, resolved_limit, resolved_min_edge, match_date)
     note = _empty_date_note(db, match_date) if not picks else None
-    if engine_path != "legacy_engine":
-        note = f"engine_path={engine_path}; fallback_reason={fallback_reason}" if fallback_reason else f"engine_path={engine_path}"
+    if engine_mode == "shadow":
+        calibrated = _calibrated_engine_picks(db, match_date, limit=resolved_limit)
+        shadow = _shadow_engine_comparison(
+            db=db,
+            match_date=match_date,
+            legacy_count=len(picks),
+            calibrated=calibrated,
+        )
+        note = (
+            f"engine_mode=shadow; engine_path=legacy_engine; "
+            f"shadow_status={shadow.get('shadow_status')}; "
+            f"calibrated_count={shadow.get('calibrated_count')}"
+        )
+        if shadow.get("calibrated_fallback_reason"):
+            note = f"{note}; calibrated_reason={shadow.get('calibrated_fallback_reason')}"
+        logger.info(
+            "Shadow mode served legacy picks: legacy=%s calibrated=%s status=%s",
+            shadow.get("legacy_count"),
+            shadow.get("calibrated_count"),
+            shadow.get("shadow_status"),
+        )
+    elif engine_path != "legacy_engine":
+        note = (
+            f"engine_mode={engine_mode}; engine_path={engine_path}; fallback_reason={fallback_reason}"
+            if fallback_reason
+            else f"engine_mode={engine_mode}; engine_path={engine_path}"
+        )
+    elif note:
+        note = f"engine_mode={engine_mode}; {note}"
+    else:
+        note = f"engine_mode={engine_mode}"
     return {
         "count": len(picks),
         "requested_date": _requested_date_value(match_date),
