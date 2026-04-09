@@ -37,6 +37,15 @@ REQUIRED_ENRICHMENT_FIELDS = (
 )
 
 
+def _field_present(payload: dict, field_name: str) -> bool:
+    value = payload.get(field_name)
+    if field_name in {"home_recent_form", "away_recent_form"}:
+        if not isinstance(value, dict):
+            return False
+        return int(value.get("sample_size") or 0) > 0
+    return value is not None
+
+
 def _safe_rate(numerator: int, denominator: int) -> Optional[float]:
     if denominator <= 0:
         return None
@@ -186,7 +195,7 @@ def enrich_fixture(db: Session, fixture: Fixture, sample_size: int = RECENT_MATC
         "h2h_summary": _h2h_summary(db, fixture.home_id, fixture.away_id, before_dt=before_dt),
     }
 
-    missing_fields = [field for field in REQUIRED_ENRICHMENT_FIELDS if payload.get(field) is None]
+    missing_fields = [field for field in REQUIRED_ENRICHMENT_FIELDS if not _field_present(payload, field)]
     if len(missing_fields) == len(REQUIRED_ENRICHMENT_FIELDS):
         completeness = "missing"
     elif missing_fields:

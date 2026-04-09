@@ -7,7 +7,7 @@ from datetime import date as calendar_date, datetime, timedelta
 from html import escape
 from pathlib import Path
 from secrets import compare_digest
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -72,7 +72,7 @@ from schemas import (
 from services.stats_service import refresh_team_statistics
 from services.fixture_enrichment import enrich_fixtures, summarize_enrichment
 from services.decision_preview import preview_for_enriched_fixture
-from services.decision_backtest import run_backtest_with_calibration_comparison
+from services.decision_backtest import resolve_market_outcome, run_backtest_with_calibration_comparison
 from services.preview_calibration import CalibrationConfig, select_best_candidate_with_calibration
 from utils.competitions import is_competition_admitted, resolve_competition
 from utils.football import (
@@ -91,6 +91,7 @@ logger = logging.getLogger(__name__)
 
 APP_VERSION = "1.6.4"
 ARTIFACTS_DIR = Path("artifacts")
+_MARKET_EVIDENCE_CACHE: Dict[Tuple[str, int], Dict[str, dict]] = {}
 
 SITE_ACCESS_USERNAME = os.getenv("SITE_ACCESS_USERNAME", "").strip()
 SITE_ACCESS_PASSWORD = os.getenv("SITE_ACCESS_PASSWORD", "").strip()
@@ -707,6 +708,59 @@ def _calibrated_engine_config() -> CalibrationConfig:
     )
 
 
+def _lightweight_market_evidence(
+    db: Session,
+    start_date: calendar_date,
+    end_date: calendar_date,
+) -> Dict[str, dict]:
+    start_dt, _ = _resolve_fixture_window(start_date)
+    _, end_dt = _resolve_fixture_window(end_date)
+    completed = (
+        db.query(Fixture)
+        .filter(Fixture.date >= start_dt, Fixture.date < end_dt)
+        .filter(Fixture.home_goals.isnot(None), Fixture.away_goals.isnot(None))
+        .all()
+    )
+    tracked_markets = (
+        "Over 1.5",
+        "Over 2.5",
+        "BTTS",
+        "Under 3.5",
+        "Home or Draw (1X)",
+        "Away or Draw (X2)",
+    )
+    counters = {market: {"samples": 0, "hits": 0} for market in tracked_markets}
+    for fixture in completed:
+        home_goals = int(fixture.home_goals or 0)
+        away_goals = int(fixture.away_goals or 0)
+        for market in tracked_markets:
+            outcome = resolve_market_outcome(market, home_goals=home_goals, away_goals=away_goals)
+            counters[market]["samples"] += 1
+            if outcome == "hit":
+                counters[market]["hits"] += 1
+
+    return {
+        market: {
+            "samples": stat["samples"],
+            "hits": stat["hits"],
+            "hit_rate": round((stat["hits"] / stat["samples"]), 4) if stat["samples"] else 0.0,
+        }
+        for market, stat in counters.items()
+    }
+
+
+def _cached_market_evidence(db: Session, resolved_date: calendar_date) -> Dict[str, dict]:
+    lookback_days = max(int(CALIBRATED_ENGINE_EVIDENCE_LOOKBACK_DAYS), 1)
+    lookback_start = resolved_date - timedelta(days=lookback_days)
+    cache_key = (resolved_date.isoformat(), lookback_days)
+    cached = _MARKET_EVIDENCE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    evidence = _lightweight_market_evidence(db, lookback_start, resolved_date)
+    _MARKET_EVIDENCE_CACHE[cache_key] = evidence
+    return evidence
+
+
 def _resolved_decision_engine_mode() -> str:
     explicit_mode = str(CALIBRATED_DECISION_ENGINE_MODE or "").strip().lower()
     if explicit_mode in {"active", "shadow"}:
@@ -716,7 +770,12 @@ def _resolved_decision_engine_mode() -> str:
     return "legacy"
 
 
-def _calibrated_engine_picks(db: Session, match_date: Optional[calendar_date], limit: int = 20):
+def _calibrated_engine_picks(
+    db: Session,
+    match_date: Optional[calendar_date],
+    limit: int = 20,
+    min_edge: float = 0.025,
+):
     resolved_date = _resolve_requested_date(match_date)
     start, end = _resolve_fixture_window(resolved_date)
     fixtures = (
@@ -728,14 +787,7 @@ def _calibrated_engine_picks(db: Session, match_date: Optional[calendar_date], l
     if not fixtures:
         return {"picks": [], "engine_path": "calibrated_engine_no_fixtures", "fallback_reason": "no_scheduled_fixtures"}
 
-    lookback_start = resolved_date - timedelta(days=max(int(CALIBRATED_ENGINE_EVIDENCE_LOOKBACK_DAYS), 1))
-    compare = run_backtest_with_calibration_comparison(
-        db,
-        lookback_start,
-        resolved_date - timedelta(days=1),
-        calibration_config=_calibrated_engine_config(),
-    )
-    evidence = compare.get("market_evidence", {})
+    evidence = _cached_market_evidence(db, resolved_date)
     calibration_config = _calibrated_engine_config()
 
     enrichment_map = enrich_fixtures(db, fixtures)
@@ -758,6 +810,10 @@ def _calibrated_engine_picks(db: Session, match_date: Optional[calendar_date], l
         confidence = float(best.get("confidence_score", 0.0) or 0.0)
         fair_odds = round(1.0 / confidence, 2) if confidence > 0 else None
         confidence_score = round(confidence * 100, 1)
+        edge = round(confidence - 0.5, 3)
+        if edge < float(min_edge):
+            skipped += 1
+            continue
         picks.append(
             {
                 "fixture_id": fixture.id,
@@ -768,7 +824,7 @@ def _calibrated_engine_picks(db: Session, match_date: Optional[calendar_date], l
                 "selection": selection,
                 "probability": round(confidence, 3),
                 "market_probability": round(confidence, 3),
-                "edge": round(confidence - 0.5, 3),
+                "edge": edge,
                 "fair_odds": fair_odds,
                 "rank_score": confidence_score,
                 "stake": round(max(confidence - 0.45, 0.0) * 10, 2),
@@ -787,9 +843,12 @@ def _calibrated_engine_picks(db: Session, match_date: Optional[calendar_date], l
     return {
         "picks": picks[:limit],
         "engine_path": "calibrated_engine",
-        "fallback_reason": "insufficient_calibrated_candidates" if (not picks and skipped > 0) else None,
+        "fallback_reason": "insufficient_calibrated_candidates_or_edge" if (not picks and skipped > 0) else None,
         "skipped_fixtures": skipped,
-        "evidence_summary": compare.get("comparison", {}),
+        "evidence_summary": {
+            "markets_with_samples": sum(1 for row in evidence.values() if int(row.get("samples", 0) or 0) > 0),
+            "lookback_days": max(int(CALIBRATED_ENGINE_EVIDENCE_LOOKBACK_DAYS), 1),
+        },
     }
 
 
@@ -2311,7 +2370,7 @@ def debug_decision_engine_compare(
     legacy_pairs = _top_predictions(db, resolved_limit, resolved_min_edge, requested_date)
     legacy = [_serialize_top_prediction(prediction, details) for prediction, details in legacy_pairs]
 
-    calibrated = _calibrated_engine_picks(db, requested_date, limit=resolved_limit)
+    calibrated = _calibrated_engine_picks(db, requested_date, limit=resolved_limit, min_edge=resolved_min_edge)
     calibrated_picks = list(calibrated.get("picks", []))
 
     report = {
@@ -2567,7 +2626,7 @@ def get_top_predictions(
     fallback_reason = None
 
     if engine_mode == "active":
-        calibrated = _calibrated_engine_picks(db, match_date, limit=resolved_limit)
+        calibrated = _calibrated_engine_picks(db, match_date, limit=resolved_limit, min_edge=resolved_min_edge)
         calibrated_picks = calibrated.get("picks", [])
         if calibrated_picks:
             logger.info("Top predictions served via calibrated engine path")
@@ -2588,7 +2647,7 @@ def get_top_predictions(
     picks = _top_predictions(db, resolved_limit, resolved_min_edge, match_date)
     note = _empty_date_note(db, match_date) if not picks else None
     if engine_mode == "shadow":
-        calibrated = _calibrated_engine_picks(db, match_date, limit=resolved_limit)
+        calibrated = _calibrated_engine_picks(db, match_date, limit=resolved_limit, min_edge=resolved_min_edge)
         shadow = _shadow_engine_comparison(
             db=db,
             match_date=match_date,
