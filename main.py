@@ -2003,6 +2003,7 @@ def _render_homepage(db: Session):
         .count()
     )
     team_count = db.query(Team).count()
+    coverage_ratio = (prediction_count / fixture_count * 100.0) if fixture_count else 0.0
     available_dates = _available_date_summaries(db, predicted_only=True)
 
     return f"""
@@ -2014,7 +2015,7 @@ def _render_homepage(db: Session):
         <title>SUMMAS | Premium Football Analytics</title>
         <style>
           :root {{
-            --bg: #0A0A0F;
+            --bg: #10131d;
             --surface: #141419;
             --surface-2: #17171F;
             --line: #2A2A35;
@@ -2025,14 +2026,17 @@ def _render_homepage(db: Session):
             --emerald: #1FA971;
             --amber: #D1972A;
             --crimson: #C64F5C;
-            --shadow: 0 16px 34px rgba(0, 0, 0, 0.35);
+            --shadow: 0 10px 26px rgba(0, 0, 0, 0.28);
           }}
           * {{ box-sizing: border-box; }}
           body {{
             margin: 0;
             font-family: Inter, "SF Pro Display", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
             color: var(--ink);
-            background: radial-gradient(circle at top right, rgba(212, 175, 55, 0.08), transparent 30%), var(--bg);
+            background:
+              radial-gradient(circle at 18% 0%, rgba(40, 119, 166, 0.14), transparent 38%),
+              radial-gradient(circle at top right, rgba(212, 175, 55, 0.05), transparent 34%),
+              var(--bg);
           }}
           .wrap {{
             max-width: 1560px;
@@ -2077,12 +2081,12 @@ def _render_homepage(db: Session):
             transform: translateY(-1px);
           }}
           .actions a.primary {{
-            background: #1A1A22;
-            border-color: rgba(212, 175, 55, .55);
-            color: #F6ECD1;
+            background: linear-gradient(180deg, #1d8b62 0%, #176f4f 100%);
+            border-color: rgba(31, 169, 113, .72);
+            color: #e8fff4;
           }}
           .actions a:focus-visible, .date-pill:focus-visible {{
-            outline: 2px solid var(--gold);
+            outline: 2px solid var(--emerald);
             outline-offset: 2px;
           }}
           .stats-grid {{
@@ -2097,6 +2101,9 @@ def _render_homepage(db: Session):
             border-radius: 12px;
             padding: 12px 14px;
             box-shadow: var(--shadow);
+          }}
+          .stat.emphasis {{
+            border-color: rgba(31, 169, 113, 0.45);
           }}
           .stat .label {{
             color: var(--muted-2);
@@ -2157,9 +2164,9 @@ def _render_homepage(db: Session):
             border-color: #3A3A47;
           }}
           .date-pill.active {{
-            background: rgba(212, 175, 55, .12);
-            border-color: rgba(212, 175, 55, .65);
-            color: #F5E9C8;
+            background: rgba(31, 169, 113, .12);
+            border-color: rgba(31, 169, 113, .66);
+            color: #DDF9EE;
           }}
           .date-pill .date-label {{
             font-weight: 700;
@@ -2213,15 +2220,23 @@ def _render_homepage(db: Session):
             align-items: center;
             padding: 6px 10px;
             border-radius: 999px;
-            background: rgba(212, 175, 55, .14);
-            color: #F5E9C8;
+            background: rgba(31, 169, 113, .18);
+            color: #DDF9EE;
             font-size: 0.8rem;
             font-weight: 700;
             letter-spacing: 0.04em;
           }}
+          .pick-card[data-confidence="medium"] .badge {{
+            background: rgba(209, 151, 42, .2);
+            color: #F2E2BE;
+          }}
+          .pick-card[data-confidence="low"] .badge {{
+            background: rgba(198, 79, 92, .2);
+            color: #F4D3D8;
+          }}
           .edge {{
             font-weight: 700;
-            color: var(--gold);
+            color: var(--emerald);
           }}
           .pick-card h3, .empty-card h3 {{
             margin: 0 0 8px;
@@ -2238,7 +2253,7 @@ def _render_homepage(db: Session):
             font-size: 1rem;
           }}
           .prob-track {{
-            height: 6px;
+            height: 5px;
             border-radius: 999px;
             background: #262631;
             overflow: hidden;
@@ -2246,7 +2261,7 @@ def _render_homepage(db: Session):
           }}
           .prob-fill {{
             height: 100%;
-            background: linear-gradient(90deg, #7d6730 0%, #d4af37 100%);
+            background: linear-gradient(90deg, #177957 0%, #24b67e 100%);
           }}
           .stats {{
             display: flex;
@@ -2275,9 +2290,9 @@ def _render_homepage(db: Session):
             width: 100%;
             padding: 11px 14px;
             border-radius: 10px;
-            border: 1px solid rgba(212, 175, 55, .6);
-            background: #1A1A22;
-            color: #F5E9C8;
+            border: 1px solid rgba(31, 169, 113, .64);
+            background: linear-gradient(180deg, #1d8b62 0%, #176f4f 100%);
+            color: #E8FFF4;
             font-weight: 700;
             font: inherit;
             cursor: pointer;
@@ -2285,7 +2300,7 @@ def _render_homepage(db: Session):
           }}
           .toolbar button:hover {{
             transform: translateY(-1px);
-            border-color: rgba(212, 175, 55, .9);
+            border-color: rgba(68, 219, 155, .8);
           }}
           .toolbar button:disabled {{ opacity: 0.6; cursor: not-allowed; }}
           .top-board {{
@@ -2296,6 +2311,7 @@ def _render_homepage(db: Session):
             color: var(--muted);
             font-size: 0.88rem;
             margin-bottom: 8px;
+            line-height: 1.5;
           }}
           .muted-link {{
             border: none;
@@ -2359,7 +2375,6 @@ def _render_homepage(db: Session):
               <a id="fixtures-json-link" href="/fixtures-view?date={today}">Readable Fixtures</a>
               <a id="summary-json-link" href="/summary?date={today}">Readable Summary</a>
               <a href="/docs">API Docs</a>
-              <a href="/status">System Status</a>
             </div>
           </section>
 
@@ -2368,7 +2383,7 @@ def _render_homepage(db: Session):
               <div class="label">Scheduled matches · next 7 days</div>
               <div class="value">{fixture_count}</div>
             </div>
-            <div class="stat">
+            <div class="stat emphasis">
               <div class="label">Predictions on file · next 7 days</div>
               <div class="value">{prediction_count}</div>
             </div>
@@ -2377,8 +2392,8 @@ def _render_homepage(db: Session):
               <div class="value">{team_count}</div>
             </div>
             <div class="stat">
-              <div class="label">Platform version</div>
-              <div class="value">{escape(APP_VERSION)}</div>
+              <div class="label">Coverage ratio</div>
+              <div class="value">{coverage_ratio:.0f}%</div>
             </div>
           </section>
 
@@ -2580,7 +2595,7 @@ def _render_homepage(db: Session):
             currentDate = dateValue || initialToday;
             dateInput.value = currentDate;
             updateLinks(currentDate);
-            statusLine.textContent = `Refreshing board for ${{currentDate}}...`;
+            statusLine.textContent = `Refreshing insights for ${{currentDate}}...`;
             currentDateLabel.textContent = `Showing ${{currentDate}}`;
             window.history.replaceState(null, "", `/?date=${{encodeURIComponent(currentDate)}}`);
 
@@ -2604,7 +2619,7 @@ def _render_homepage(db: Session):
             if (needsAutoCollect) {{
               autoCollectAttempts.add(currentDate);
               runInFlightDates.add(currentDate);
-              statusLine.textContent = `Auto-refreshing matches and predictions for ${{currentDate}}...`;
+              statusLine.textContent = `Gathering the latest fixtures and recommendations for ${{currentDate}}...`;
               try {{
                 await fetchJson(`/run?source=hybrid&date=${{encodeURIComponent(currentDate)}}`);
                 await refreshDates(currentDate);
@@ -2625,13 +2640,13 @@ def _render_homepage(db: Session):
 
             const summary = availableDates.find((item) => item.date === currentDate);
             if (daySummary) {{
-              statusLine.textContent = `Live for ${{currentDate}}: ${{daySummary.raw_fixtures ?? 0}} collected, ${{daySummary.analyzable_fixtures ?? 0}} ready to analyze, ${{daySummary.predicted_fixtures ?? 0}} with predictions, ${{daySummary.ranked_picks ?? 0}} on the board. Auto-refresh every 30 seconds.`;
+              statusLine.textContent = `Updated ${{currentDate}}: ${{daySummary.predicted_fixtures ?? 0}} matches now include predictions with ${{daySummary.ranked_picks ?? 0}} top opportunities highlighted. Auto-refresh every 30 seconds.`;
             }} else if (summary) {{
-              statusLine.textContent = `Using saved data for ${{currentDate}}: ${{summary.fixtures}} matches and ${{summary.predictions}} predicted fixtures. Auto-refresh every 30 seconds.`;
+              statusLine.textContent = `Showing saved results for ${{currentDate}}: ${{summary.fixtures}} fixtures and ${{summary.predictions}} predicted matches. Auto-refresh every 30 seconds.`;
             }} else if (payload.note) {{
               statusLine.textContent = payload.note;
             }} else {{
-              statusLine.textContent = `No saved board entries for ${{currentDate}} yet. Auto-refresh every 30 seconds.`;
+              statusLine.textContent = `No saved opportunities for ${{currentDate}} yet. Auto-refresh every 30 seconds.`;
             }}
           }}
 
@@ -2662,7 +2677,7 @@ def _render_homepage(db: Session):
             updateLinks(currentDate);
             setBusyState(true);
             runInFlightDates.add(currentDate);
-            statusLine.textContent = `Running collection and prediction flow for ${{currentDate}}...`;
+            statusLine.textContent = `Running selected date for ${{currentDate}}...`;
 
             try {{
               const payload = await fetchJson(`/run?source=hybrid&date=${{encodeURIComponent(currentDate)}}`);
@@ -2672,11 +2687,9 @@ def _render_homepage(db: Session):
               if (payload?.note) {{
                 statusLine.textContent = payload.note;
               }} else {{
-                const scraped = payload?.results?.scraped ?? 0;
                 const created = payload?.results?.predictions_created ?? 0;
-                const analyzable = payload?.collection?.analyzable_fixtures ?? 0;
                 const ranked = payload?.collection?.ranked_picks ?? 0;
-                statusLine.textContent = `Run complete for ${{currentDate}}: ${{scraped}} matches collected, ${{analyzable}} ready for analysis, ${{created}} predictions saved, and ${{ranked}} board entries published.`;
+                statusLine.textContent = `Run complete for ${{currentDate}}: ${{created}} predictions saved and ${{ranked}} top opportunities published.`;
               }}
             }} catch (error) {{
               statusLine.textContent = `Couldn't run ${{currentDate}}: ${{error.message || "Unknown error"}}`;
@@ -2719,23 +2732,27 @@ def _layout_shell(title: str, body: str) -> str:
         <title>{escape(title)}</title>
         <style>
           :root {{
-            --bg: #0A0A0F;
+            --bg: #10131d;
             --ink: #F5F6FA;
             --card: #141419;
             --line: #2A2A35;
             --accent: #D4AF37;
             --accent-soft: rgba(212, 175, 55, 0.14);
+            --success: #1FA971;
             --muted: #B8B6C5;
             --warn: #D1972A;
             --surface: #17171F;
-            --shadow: 0 16px 34px rgba(0, 0, 0, 0.35);
+            --shadow: 0 10px 28px rgba(0, 0, 0, 0.28);
           }}
           * {{ box-sizing: border-box; }}
           body {{
             margin: 0;
             font-family: Inter, "SF Pro Display", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
             color: var(--ink);
-            background: radial-gradient(circle at top right, rgba(212, 175, 55, 0.08), transparent 30%), var(--bg);
+            background:
+              radial-gradient(circle at 18% 0%, rgba(40, 119, 166, 0.14), transparent 38%),
+              radial-gradient(circle at top right, rgba(212, 175, 55, 0.05), transparent 34%),
+              var(--bg);
           }}
           .wrap {{
             max-width: 1560px;
@@ -2775,9 +2792,9 @@ def _layout_shell(title: str, body: str) -> str:
             transform: translateY(-1px);
           }}
           .actions a.primary {{
-            background: #1A1A22;
-            color: #F5E9C8;
-            border-color: rgba(212, 175, 55, .6);
+            background: linear-gradient(180deg, #1d8b62 0%, #176f4f 100%);
+            color: #E8FFF4;
+            border-color: rgba(31, 169, 113, .72);
           }}
           .section {{
             margin-top: 26px;
@@ -2798,7 +2815,7 @@ def _layout_shell(title: str, body: str) -> str:
             background: var(--card);
             border: 1px solid var(--line);
             border-radius: 14px;
-            padding: 18px;
+            padding: 20px;
             box-shadow: var(--shadow);
           }}
           .pill {{
@@ -2806,8 +2823,8 @@ def _layout_shell(title: str, body: str) -> str:
             align-items: center;
             padding: 5px 10px;
             border-radius: 999px;
-            background: var(--accent-soft);
-            color: #0e6f52;
+            background: rgba(31, 169, 113, 0.16);
+            color: #DDF9EE;
             font-size: 0.82rem;
             font-weight: 700;
             letter-spacing: 0.04em;
@@ -2912,20 +2929,34 @@ def _format_pick_card(rank: int, prediction: Prediction, details: dict) -> str:
     reasons = "".join(f"<li>{escape(reason)}</li>" for reason in details["main_reasons"]) or "<li>No standout signals were recorded for this pick.</li>"
     risks = "".join(f"<li>{escape(note)}</li>" for note in details["risk_notes"]) if details["risk_notes"] else "<li>No major warning signs were flagged here.</li>"
     grade_value = str(details.get("confidence_grade", "MEDIUM")).upper()
-    edge_color = "var(--warn)" if prediction.edge < 0.03 else "var(--accent)"
+    edge_color = "var(--warn)" if prediction.edge < 0.03 else "var(--success)"
     grade_border = "#C64F5C" if "LOW" in grade_value else ("#1FA971" if "HIGH" in grade_value else "rgba(212, 175, 55, .6)")
     probability_width = max(0.0, min(1.0, float(prediction.probability or 0.0))) * 100.0
+    rank_pill_style = (
+        "background: var(--accent-soft); color: #F4E5BF;"
+        if rank == 1
+        else "background: rgba(31, 169, 113, 0.16); color: #DDF9EE;"
+    )
+    grade_pill_style = (
+        "background: rgba(198, 79, 92, 0.18); color: #F4D3D8;"
+        if "LOW" in grade_value
+        else (
+            "background: rgba(31, 169, 113, 0.2); color: #DDF9EE;"
+            if "HIGH" in grade_value
+            else "background: rgba(209, 151, 42, 0.2); color: #F2E2BE;"
+        )
+    )
     return f"""
       <article class="card" style="border-left:4px solid {grade_border};">
         <div class="section-head">
-          <span class="pill">Rank {rank}</span>
-          <span class="pill">{escape(grade_value)}</span>
+          <span class="pill" style="{rank_pill_style}">Rank {rank}</span>
+          <span class="pill" style="{grade_pill_style}">{escape(grade_value)}</span>
         </div>
         <h3>{escape(match)}</h3>
         <p class="meta">{escape(str(league))} | {escape(str(fixture.date) if fixture else "")}</p>
         <p style="margin-top:12px;"><strong>{escape(market_display_name(prediction.market))}</strong>: {escape(prediction.selection or "")}</p>
-        <div style="height:6px;border-radius:999px;background:#262631;overflow:hidden;margin-top:12px;">
-          <div style="height:100%;width:{probability_width:.1f}%;background:linear-gradient(90deg,#7d6730 0%,#d4af37 100%);"></div>
+        <div style="height:5px;border-radius:999px;background:#262631;overflow:hidden;margin-top:12px;">
+          <div style="height:100%;width:{probability_width:.1f}%;background:linear-gradient(90deg,#177957 0%,#24b67e 100%);"></div>
         </div>
         <div class="kv">
           <div><span>Model probability</span><br />{prediction.probability:.1%}</div>
@@ -3004,7 +3035,7 @@ def _render_day_summary_page(
     body = f"""
       <section class="hero">
         <h1>Daily Performance Snapshot</h1>
-        <p class="muted">A clear operational view of {escape(resolved_date.isoformat())}, from collected matches through final board output.</p>
+        <p class="muted">A clear view of {escape(resolved_date.isoformat())}, from fixture coverage through final opportunities.</p>
         <div class="actions">
           <a class="primary" href="/?date={escape(resolved_date.isoformat())}">Back To Dashboard</a>
           <a href="/board?date={escape(resolved_date.isoformat())}">Readable Board</a>
@@ -3013,11 +3044,11 @@ def _render_day_summary_page(
       </section>
       <section class="section">
         <div class="section-head">
-          <h2>Coverage funnel</h2>
+          <h2>Coverage journey</h2>
           <span class="muted">How much moved through each stage</span>
         </div>
         <div class="grid wide">
-          <article class="card"><h3>Collected</h3><p class="meta">{summary["raw_fixtures"]} matches gathered</p></article>
+          <article class="card"><h3>Collected</h3><p class="meta">{summary["raw_fixtures"]} fixtures gathered</p></article>
           <article class="card"><h3>Unique Matches</h3><p class="meta">{summary["unique_fixtures"]} distinct fixtures</p></article>
           <article class="card"><h3>Ready for analysis</h3><p class="meta">{summary["analyzable_fixtures"]} met quality standards</p></article>
           <article class="card"><h3>Predicted</h3><p class="meta">{summary["predicted_fixtures"]} matches with saved predictions</p></article>
