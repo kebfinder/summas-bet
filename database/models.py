@@ -82,3 +82,31 @@ class Prediction(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     
     fixture = relationship("Fixture")
+
+
+class FixtureIngestionProvenance(Base):
+    __tablename__ = "fixture_ingestion_provenance"
+
+    id = Column(Integer, primary_key=True)
+    fixture_id = Column(Integer, ForeignKey("fixtures.id"), nullable=False, index=True)
+    source_name = Column(String, nullable=False, index=True)
+    source_url = Column(String, nullable=True)
+    adapter_mode = Column(String, nullable=True)
+    provider_name = Column(String, nullable=True)
+    requested_date = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+    fixture = relationship("Fixture")
+
+
+class PublicWebProviderHealthEvent(Base):
+    __tablename__ = "public_web_provider_health_events"
+
+    id = Column(Integer, primary_key=True)
+    provider_key = Column(String, nullable=False, index=True)
+    adapter_name = Column(String, nullable=False, index=True)
+    provider_name = Column(String, nullable=False, index=True)
+    event = Column(String, nullable=False)
+    requested_date = Column(String, nullable=True)
+    detail = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
