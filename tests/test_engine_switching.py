@@ -211,3 +211,60 @@ def test_calibrated_engine_picks_applies_min_edge(monkeypatch):
     out = main._calibrated_engine_picks(_DB([_Fixture()]), match_date=datetime(2026, 4, 9).date(), limit=20, min_edge=0.02)
     assert out["picks"] == []
     assert out["fallback_reason"] == "insufficient_calibrated_candidates_or_edge"
+
+
+def test_ranked_predictions_reason_uses_effective_threshold(monkeypatch):
+    class _Fixture:
+        id = 99
+        league = "Test League"
+
+    class _Prediction:
+        fixture = _Fixture()
+        edge = 0.141
+        odds = 2.1
+        probability = 0.6
+        market = "Over2.5"
+        selection = "Over 2.5"
+        expected_home_goals = 1.6
+        expected_away_goals = 1.2
+        stake = 1.0
+
+    monkeypatch.setattr(main, "market_implied_probability", lambda market, selection: (0.5, 2.0))
+    monkeypatch.setattr(main, "market_stability", lambda market: 0.6)
+    monkeypatch.setattr(main, "market_threshold", lambda market: 0.04)
+    monkeypatch.setattr(main, "market_volatility", lambda market: "medium")
+    monkeypatch.setattr(main, "market_is_qualified", lambda market, edge, data_quality: True)
+
+    context = {
+        "data_quality": 0.8,
+        "venue_support": 0.8,
+        "league": {"matches": 100},
+        "competition": {"confidence_delta": 0.0},
+        "form_gap": 0.0,
+    }
+    details = main._prediction_details(_Prediction(), context, min_edge=0.07)
+    assert any("7.0%" in reason for reason in details["main_reasons"])
+    assert details["effective_threshold"] == 0.07
+
+
+def test_debug_compare_reports_applied_min_edge(monkeypatch):
+    captured = {}
+
+    def _fake_top_predictions(db, limit, min_edge, requested_date):
+        captured["legacy_min_edge"] = min_edge
+        return [("legacy", {"rank_score": 80})]
+
+    def _fake_calibrated(db, requested_date, limit=20, min_edge=0.0):
+        captured["calibrated_min_edge"] = min_edge
+        return {"picks": [{"fixture_id": 1, "edge": 0.03, "confidence_score": 72.0}], "engine_path": "calibrated_engine"}
+
+    monkeypatch.setattr(main, "_top_predictions", _fake_top_predictions)
+    monkeypatch.setattr(main, "_serialize_top_prediction", lambda prediction, details: {"fixture_id": 1, "edge": 0.031, "confidence_score": 70.0})
+    monkeypatch.setattr(main, "_calibrated_engine_picks", _fake_calibrated)
+    monkeypatch.setattr(main, "_write_engine_compare_artifact", lambda report, requested_date: "artifacts/x.json")
+
+    report = main.debug_decision_engine_compare(match_date=datetime(2026, 4, 9).date(), limit=10, min_edge=0.08, db=_DummyDB())
+
+    assert captured["legacy_min_edge"] == 0.08
+    assert captured["calibrated_min_edge"] == 0.08
+    assert report["applied_filters"]["min_edge"] == 0.08
