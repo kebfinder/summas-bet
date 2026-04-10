@@ -49,3 +49,11 @@ def test_render_homepage_preserves_view_more_js_template(monkeypatch):
     assert "`View more (${sortedRows.length - 3} more)`" in html
     assert "Run Selected Date" in html
     assert "Show fewer dates" in html
+    assert "if (isKnownDate(queryDate))" in html
+    assert "if (isKnownDate(storedDate))" in html
+
+
+def test_smoke_script_sets_repo_root_path():
+    script_text = Path("scripts/smoke_public_web.py").read_text(encoding="utf-8")
+    assert "Path(__file__).resolve().parents[1]" in script_text
+    assert "sys.path.insert(0" in script_text

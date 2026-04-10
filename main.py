@@ -36,7 +36,7 @@ from config import (
     PUBLIC_WEB_REQUIRED_SUCCESS,
 )
 from database.database import Base, engine, get_db
-from database.models import Fixture, HistoricalMatch, Prediction, Team
+from database.models import Fixture, FixtureIngestionProvenance, HistoricalMatch, Prediction, PublicWebProviderHealthEvent, Team
 from engine.match_model import (
     blend_with_market_probability,
     build_match_context,
@@ -97,6 +97,15 @@ logger = logging.getLogger(__name__)
 APP_VERSION = "1.6.4"
 ARTIFACTS_DIR = Path("artifacts")
 _MARKET_EVIDENCE_CACHE: Dict[Tuple[str, int], Dict[str, dict]] = {}
+_PUBLIC_WEB_TEAM_ALIAS_MAP = {
+    "man utd": "Manchester United",
+    "man united": "Manchester United",
+    "man city": "Manchester City",
+    "spurs": "Tottenham Hotspur",
+    "inter": "Inter Milan",
+    "atleti": "Atletico Madrid",
+    "psg": "Paris Saint-Germain",
+}
 
 SITE_ACCESS_USERNAME = os.getenv("SITE_ACCESS_USERNAME", "").strip()
 SITE_ACCESS_PASSWORD = os.getenv("SITE_ACCESS_PASSWORD", "").strip()
@@ -323,6 +332,72 @@ def _get_or_create_team_for_public_web(db: Session, name: str, league: Optional[
     return team
 
 
+def _canonicalize_public_web_team_name(raw_name: Optional[str]) -> tuple[str, bool]:
+    normalized = normalize_team_name(raw_name)
+    alias_hit = False
+    alias_value = _PUBLIC_WEB_TEAM_ALIAS_MAP.get(normalized.lower())
+    if alias_value:
+        normalized = normalize_team_name(alias_value)
+        alias_hit = True
+    return normalized, alias_hit
+
+
+def _record_public_web_provenance(
+    db: Session,
+    *,
+    fixture_id: Optional[int],
+    source_name: str,
+    source_url: Optional[str],
+    adapter_mode: str,
+    provider_name: Optional[str],
+    requested_date: calendar_date,
+) -> None:
+    if fixture_id is None:
+        return
+    event = FixtureIngestionProvenance(
+        fixture_id=int(fixture_id),
+        source_name=str(source_name or "public_web"),
+        source_url=str(source_url or ""),
+        adapter_mode=str(adapter_mode or "unknown"),
+        provider_name=str(provider_name or ""),
+        requested_date=requested_date.isoformat(),
+    )
+    db.add(event)
+
+
+def _record_provider_health_events(
+    db: Session,
+    *,
+    adapter_name: str,
+    requested_date: calendar_date,
+    provider_used: Optional[str],
+    provider_failures: Optional[dict],
+) -> None:
+    failures = dict(provider_failures or {})
+    for provider_name, reason in failures.items():
+        db.add(
+            PublicWebProviderHealthEvent(
+                provider_key=f"{adapter_name}:{provider_name}",
+                adapter_name=adapter_name,
+                provider_name=str(provider_name),
+                event="failure",
+                requested_date=requested_date.isoformat(),
+                detail=str(reason),
+            )
+        )
+    if provider_used:
+        db.add(
+            PublicWebProviderHealthEvent(
+                provider_key=f"{adapter_name}:{provider_used}",
+                adapter_name=adapter_name,
+                provider_name=str(provider_used),
+                event="success",
+                requested_date=requested_date.isoformat(),
+                detail=None,
+            )
+        )
+
+
 def _collect_public_web_bundle(db: Session, match_date: Optional[calendar_date] = None, days_ahead: int = 0):
     requested_date = _resolve_requested_date(match_date) + timedelta(days=max(int(days_ahead or 0), 0))
     configured_allowed_sources = tuple(source.strip().lower() for source in PUBLIC_WEB_ALLOWED_SOURCES if source.strip())
@@ -340,6 +415,20 @@ def _collect_public_web_bundle(db: Session, match_date: Optional[calendar_date] 
         "adapter_failures": {},
         "allowlist_mode": allowlist_mode,
         "allowed_sources": list(configured_allowed_sources),
+        "implemented_adapters": [],
+        "adapter_candidate_counts": {},
+        "adapter_persisted_counts": {},
+        "competition_candidate_counts": {},
+        "competition_persisted_counts": {},
+        "dropped_candidates": {"invalid_identity": 0, "ingest_failures": 0},
+        "adapter_modes": {},
+        "adapter_stage_counts": {},
+        "adapter_provider_usage": {},
+        "adapter_provider_failures": {},
+        "adapter_provider_order": {},
+        "team_alias_hits": 0,
+        "team_alias_hit_examples": [],
+        "unmapped_team_name_samples": [],
     }
     if not PUBLIC_WEB_ENABLED:
         base_status["failure_reason"] = "PUBLIC_WEB_ENABLED is false"
@@ -392,21 +481,82 @@ def _collect_public_web_bundle(db: Session, match_date: Optional[calendar_date] 
     fixture_ids: list[int] = []
     raw_candidates = 0
     failures: dict[str, str] = {}
+    adapter_candidate_counts: dict[str, int] = {}
+    adapter_persisted_counts: dict[str, int] = {}
+    adapter_stage_counts: dict[str, dict[str, int]] = {}
+    adapter_provider_usage: dict[str, Optional[str]] = {}
+    adapter_provider_failures: dict[str, dict[str, str]] = {}
+    adapter_provider_order: dict[str, list[str]] = {}
+    competition_candidate_counts: dict[str, int] = {}
+    competition_persisted_counts: dict[str, int] = {}
+    dropped_invalid_identity = 0
+    dropped_ingest_failures = 0
+    team_alias_hits = 0
+    alias_examples: list[str] = []
+    unmapped_team_samples: list[str] = []
+
+    base_status["implemented_adapters"] = [adapter.source_name for adapter in adapters]
+    base_status["adapter_modes"] = {
+        adapter.source_name: ("browser_assisted_js" if "official_js_" in adapter.source_name else "static_fetch")
+        for adapter in adapters
+    }
 
     for adapter in adapters:
+        adapter_stage_counts[adapter.source_name] = {
+            "raw_rows_found": 0,
+            "parsed_fixtures": 0,
+            "mapped_candidates": 0,
+            "persisted_fixtures": 0,
+            "rejected_identity": 0,
+            "ingest_failures": 0,
+        }
         try:
             discovered = adapter.discover(requested_date, plan) or []
+            diagnostics = getattr(adapter, "last_run_diagnostics", {}) or {}
+            adapter_stage_counts[adapter.source_name]["raw_rows_found"] = int(
+                diagnostics.get("raw_rows_found", len(discovered))
+            )
+            adapter_stage_counts[adapter.source_name]["parsed_fixtures"] = int(
+                diagnostics.get("parsed_fixtures", len(discovered))
+            )
+            adapter_provider_usage[adapter.source_name] = diagnostics.get("provider_used")
+            adapter_provider_failures[adapter.source_name] = dict(diagnostics.get("provider_failures", {}))
+            adapter_provider_order[adapter.source_name] = list(diagnostics.get("provider_order", []))
+            _record_provider_health_events(
+                db,
+                adapter_name=adapter.source_name,
+                requested_date=requested_date,
+                provider_used=adapter_provider_usage[adapter.source_name],
+                provider_failures=adapter_provider_failures[adapter.source_name],
+            )
         except Exception as exc:
             failures[adapter.source_name] = str(exc)
+            adapter_candidate_counts[adapter.source_name] = 0
+            adapter_persisted_counts[adapter.source_name] = 0
             logger.warning("public_web adapter %s failed for %s: %s", adapter.source_name, requested_date.isoformat(), exc)
             continue
 
         raw_candidates += len(discovered)
+        adapter_candidate_counts[adapter.source_name] = len(discovered)
+        persisted_before = len(fixture_ids)
         for candidate in discovered:
-            home_name = normalize_team_name(candidate.home_team)
-            away_name = normalize_team_name(candidate.away_team)
+            home_name, home_alias = _canonicalize_public_web_team_name(candidate.home_team)
+            away_name, away_alias = _canonicalize_public_web_team_name(candidate.away_team)
+            if home_alias:
+                team_alias_hits += 1
+                if len(alias_examples) < 10:
+                    alias_examples.append(str(candidate.home_team))
+            if away_alias:
+                team_alias_hits += 1
+                if len(alias_examples) < 10:
+                    alias_examples.append(str(candidate.away_team))
             if not home_name or not away_name or home_name == away_name:
+                dropped_invalid_identity += 1
+                adapter_stage_counts[adapter.source_name]["rejected_identity"] += 1
+                if len(unmapped_team_samples) < 20:
+                    unmapped_team_samples.extend([str(candidate.home_team or ""), str(candidate.away_team or "")])
                 continue
+            adapter_stage_counts[adapter.source_name]["mapped_candidates"] += 1
 
             competition = resolve_competition("storage", name=candidate.competition_name)
             league_name = (
@@ -414,6 +564,7 @@ def _collect_public_web_bundle(db: Session, match_date: Optional[calendar_date] 
                 if competition
                 else (candidate.competition_name or "Public Web")
             )
+            competition_candidate_counts[league_name] = competition_candidate_counts.get(league_name, 0) + 1
             kickoff_dt = _parse_public_web_kickoff(requested_date, candidate.kickoff_time)
             day_start = datetime.combine(requested_date, datetime.min.time())
             day_end = day_start + timedelta(days=1)
@@ -440,6 +591,16 @@ def _collect_public_web_bundle(db: Session, match_date: Optional[calendar_date] 
                             existing.league = league_name
                         db.flush()
                         fixture_ids.append(existing.id)
+                        competition_persisted_counts[league_name] = competition_persisted_counts.get(league_name, 0) + 1
+                        _record_public_web_provenance(
+                            db,
+                            fixture_id=existing.id,
+                            source_name=adapter.source_name,
+                            source_url=candidate.source_url,
+                            adapter_mode=base_status["adapter_modes"].get(adapter.source_name, "unknown"),
+                            provider_name=adapter_provider_usage.get(adapter.source_name),
+                            requested_date=requested_date,
+                        )
                         continue
 
                     fixture = Fixture(
@@ -453,9 +614,25 @@ def _collect_public_web_bundle(db: Session, match_date: Optional[calendar_date] 
                     db.flush()
                     if fixture.id is not None:
                         fixture_ids.append(fixture.id)
+                        competition_persisted_counts[league_name] = competition_persisted_counts.get(league_name, 0) + 1
+                        _record_public_web_provenance(
+                            db,
+                            fixture_id=fixture.id,
+                            source_name=adapter.source_name,
+                            source_url=candidate.source_url,
+                            adapter_mode=base_status["adapter_modes"].get(adapter.source_name, "unknown"),
+                            provider_name=adapter_provider_usage.get(adapter.source_name),
+                            requested_date=requested_date,
+                        )
             except Exception as exc:
                 failures[adapter.source_name] = str(exc)
+                dropped_ingest_failures += 1
+                adapter_stage_counts[adapter.source_name]["ingest_failures"] += 1
                 logger.warning("public_web candidate ingest failed (%s): %s", adapter.source_name, exc)
+        adapter_persisted_counts[adapter.source_name] = len(fixture_ids) - persisted_before
+        adapter_stage_counts[adapter.source_name]["persisted_fixtures"] = max(
+            int(adapter_persisted_counts[adapter.source_name]), 0
+        )
 
     try:
         db.commit()
@@ -474,16 +651,43 @@ def _collect_public_web_bundle(db: Session, match_date: Optional[calendar_date] 
             "failed": bool(failures),
             "failure_reason": "; ".join(f"{k}: {v}" for k, v in failures.items()) if failures else None,
             "adapter_failures": failures,
+            "adapter_candidate_counts": dict(adapter_candidate_counts),
+            "adapter_persisted_counts": dict(adapter_persisted_counts),
+            "adapter_stage_counts": dict(adapter_stage_counts),
+            "adapter_provider_usage": dict(adapter_provider_usage),
+            "adapter_provider_failures": dict(adapter_provider_failures),
+            "adapter_provider_order": dict(adapter_provider_order),
+            "team_alias_hits": int(team_alias_hits),
+            "team_alias_hit_examples": list(dict.fromkeys(alias_examples))[:10],
+            "unmapped_team_name_samples": [item for item in dict.fromkeys(unmapped_team_samples) if item][:10],
+            "competition_candidate_counts": dict(sorted(competition_candidate_counts.items(), key=lambda item: item[0])),
+            "competition_persisted_counts": dict(sorted(competition_persisted_counts.items(), key=lambda item: item[0])),
+            "dropped_candidates": {
+                "invalid_identity": int(dropped_invalid_identity),
+                "ingest_failures": int(dropped_ingest_failures),
+            },
         }
     )
+    if status["raw_fixtures"] == 0 and not status["failed"]:
+        status["failure_reason"] = "Adapters returned zero candidates for requested date."
+    fixtures = _reload_fixtures_by_ids(db, unique_ids)
+    enrichment_summary = summarize_enrichment(enrich_fixtures(db, fixtures))
+    status["enrichment_summary"] = enrichment_summary
+    status["analyzable_candidates_estimate"] = int(
+        enrichment_summary.get("fully_enriched_count", 0) + enrichment_summary.get("partially_enriched_count", 0)
+    )
     logger.info(
-        "public_web collection %s | mode=%s allowed=%s raw=%s unique=%s dedupe_removed=%s failed=%s reason=%s",
+        "public_web collection %s | mode=%s allowed=%s adapters=%s raw=%s unique=%s dedupe_removed=%s dropped_invalid=%s ingest_failures=%s analyzable_est=%s failed=%s reason=%s",
         requested_date.isoformat(),
         allowlist_mode,
         ",".join(configured_allowed_sources) if configured_allowed_sources else "ALL",
+        ",".join(status.get("implemented_adapters", [])) or "NONE",
         status["raw_fixtures"],
         status["survived_unique_fixtures"],
         status["duplicates_removed"],
+        status["dropped_candidates"]["invalid_identity"],
+        status["dropped_candidates"]["ingest_failures"],
+        status["analyzable_candidates_estimate"],
         status["failed"],
         status["failure_reason"],
     )
@@ -491,7 +695,7 @@ def _collect_public_web_bundle(db: Session, match_date: Optional[calendar_date] 
         "source": "public_web",
         "source_breakdown": {"public_web": len(unique_ids)},
         "raw_fixtures": int(raw_candidates),
-        "fixtures": _reload_fixtures_by_ids(db, unique_ids),
+        "fixtures": fixtures,
         "source_status": {"public_web": status},
         "note": None if not failures else f"public_web partial failure: {status['failure_reason']}",
     }
@@ -518,6 +722,22 @@ def _public_web_failure_bundle(match_date: Optional[calendar_date], reason: str)
                 "failure_reason": safe_reason,
                 "allowlist_mode": "explicit_allowlist" if allowlist_active else "all_supported_sources",
                 "allowed_sources": list(configured_allowed_sources),
+                "implemented_adapters": [],
+                "adapter_candidate_counts": {},
+                "adapter_persisted_counts": {},
+                "competition_candidate_counts": {},
+                "competition_persisted_counts": {},
+                "dropped_candidates": {"invalid_identity": 0, "ingest_failures": 0},
+                "adapter_modes": {},
+                "adapter_stage_counts": {},
+                "adapter_provider_usage": {},
+                "adapter_provider_failures": {},
+                "adapter_provider_order": {},
+                "team_alias_hits": 0,
+                "team_alias_hit_examples": [],
+                "unmapped_team_name_samples": [],
+                "enrichment_summary": summarize_enrichment({}),
+                "analyzable_candidates_estimate": 0,
             }
         },
         "note": f"public_web failed safely: {safe_reason}",
@@ -1283,12 +1503,13 @@ def _confidence_grade(confidence_score: float) -> str:
     return "Watchlist"
 
 
-def _prediction_details(prediction: Prediction, context: dict) -> dict:
+def _prediction_details(prediction: Prediction, context: dict, min_edge: float = 0.0) -> dict:
     market_probability, _ = market_implied_probability(prediction.market, prediction.selection)
     market_probability = round(market_probability or 0.0, 3)
     fair_odds = round(1.0 / prediction.probability, 2) if prediction.probability else None
     stability = market_stability(prediction.market)
     threshold = market_threshold(prediction.market)
+    effective_threshold = max(float(threshold), float(min_edge or 0.0))
     volatility = market_volatility(prediction.market)
     flags = _competition_flags(prediction.fixture.league if prediction.fixture else None)
     competition = context.get("competition", {})
@@ -1356,8 +1577,8 @@ def _prediction_details(prediction: Prediction, context: dict) -> dict:
         reasons.append(f"Projected match total is muted at {total_xg:.2f} goals.")
     if data_quality >= 0.72:
         reasons.append("Recent team and league samples are reasonably stable.")
-    if prediction.edge >= threshold + 0.05:
-        reasons.append(f"Edge clears the {threshold:.1%} qualification line by a healthy margin.")
+    if prediction.edge >= effective_threshold + 0.05:
+        reasons.append(f"Edge clears the {effective_threshold:.1%} qualification line by a healthy margin.")
     reasons = reasons[:3]
 
     risk_notes = []
@@ -1388,6 +1609,8 @@ def _prediction_details(prediction: Prediction, context: dict) -> dict:
         "main_reasons": reasons,
         "risk_notes": risk_notes,
         "qualified": market_is_qualified(prediction.market, prediction.edge, data_quality),
+        "market_threshold": round(float(threshold), 4),
+        "effective_threshold": round(float(effective_threshold), 4),
     }
 
 
@@ -1567,7 +1790,7 @@ def _ranked_predictions_for_fixture(db: Session, fixture: Fixture, min_edge: flo
     for prediction in predictions:
         if prediction.edge < min_edge:
             continue
-        details = _prediction_details(prediction, context)
+        details = _prediction_details(prediction, context, min_edge=min_edge)
         if prediction.stake <= 0 and not details["qualified"]:
             continue
         ranked.append((prediction, details))
@@ -1610,362 +1833,169 @@ def _render_homepage(db: Session):
       <head>
         <meta charset="utf-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1" />
-        <title>Football Prediction API</title>
+        <title>SUMMAS Analytics Dashboard</title>
         <style>
           :root {{
-            --bg: #f3efe5;
-            --ink: #17221f;
-            --card: #fffaf2;
-            --line: #d7cfbf;
-            --accent: #0e8f68;
-            --accent-soft: #d9f3ea;
-            --muted: #5d695f;
+            --bg:#101b2d;
+            --bg-soft:#14233a;
+            --panel:#182a45;
+            --panel-2:#1d3354;
+            --line:#2a4468;
+            --text:#ecf2fa;
+            --text-muted:#a8b8cf;
+            --text-dim:#7f94b1;
+            --green:#0fa66d;
+            --green-soft:rgba(15,166,109,.16);
+            --gold:#c8a965;
           }}
-          * {{ box-sizing: border-box; }}
+          * {{ box-sizing:border-box; }}
           body {{
-            margin: 0;
-            font-family: "Segoe UI", Tahoma, sans-serif;
-            color: var(--ink);
-            background:
-              radial-gradient(circle at top left, rgba(14, 143, 104, 0.14), transparent 28%),
-              linear-gradient(180deg, #fbf7ef 0%, var(--bg) 100%);
+            margin:0;
+            font-family: "Inter","Segoe UI",Tahoma,sans-serif;
+            color:var(--text);
+            background: radial-gradient(circle at 10% -10%, rgba(28,60,97,.45), transparent 42%), linear-gradient(180deg, #0f1a2c 0%, #0f1a2c 100%);
           }}
-          .wrap {{
-            max-width: 1340px;
-            margin: 0 auto;
-            padding: 18px 14px 28px;
+          .shell {{ max-width:1380px; margin:0 auto; padding:20px 16px 30px; }}
+          .topnav {{ display:flex; justify-content:space-between; align-items:center; gap:16px; margin-bottom:18px; }}
+          .brand {{ font-size:1.1rem; font-weight:700; letter-spacing:.02em; }}
+          .brand .dot {{ color:var(--gold); }}
+          .nav-links {{ display:flex; gap:8px; flex-wrap:wrap; }}
+          .nav-links a {{ text-decoration:none; color:var(--text-muted); border:1px solid var(--line); background:var(--bg-soft); padding:8px 11px; border-radius:10px; font-size:.88rem; }}
+          .nav-links a.primary {{ color:#fff; border-color:var(--green); background:var(--green); }}
+          .context {{ margin-bottom:14px; }}
+          .context h1 {{ margin:0 0 4px; font-size:clamp(1.7rem,3.4vw,2.45rem); }}
+          .context p {{ margin:0; color:var(--text-muted); font-size:1rem; }}
+          .kpi-strip {{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; margin:14px 0; }}
+          .kpi {{ background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:10px 12px; min-height:74px; }}
+          .kpi .label {{ color:var(--text-dim); font-size:.79rem; }}
+          .kpi .value {{ margin-top:4px; font-size:1.36rem; font-weight:700; }}
+          .control {{ background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:14px; margin-bottom:14px; }}
+          .control-head {{ display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; gap:12px; }}
+          .control-head h2 {{ margin:0; font-size:1.2rem; }}
+          .control-head span {{ color:var(--text-muted); font-size:.9rem; }}
+          .toolbar {{ display:grid; grid-template-columns:1fr; gap:8px; margin-bottom:8px; }}
+          .toolbar input[type="date"] {{ width:100%; background:var(--panel-2); color:var(--text); border:1px solid var(--line); border-radius:10px; padding:11px 12px; font:inherit; }}
+          .toolbar button {{ border:1px solid var(--green); background:var(--green); color:white; border-radius:10px; padding:11px 14px; font:inherit; font-weight:700; cursor:pointer; }}
+          .toolbar button:disabled {{ opacity:.65; cursor:not-allowed; }}
+          .status-line {{ margin:0 0 10px; color:var(--text-muted); font-size:.9rem; }}
+          .date-strip {{ display:grid; grid-template-columns:1fr; gap:8px; }}
+          .date-pill {{ border:1px solid var(--line); background:var(--panel-2); color:var(--text); border-radius:10px; padding:10px; text-align:left; cursor:pointer; }}
+          .date-pill.active {{ border-color:var(--green); background:var(--green-soft); }}
+          .date-pill .date-label {{ display:block; font-weight:700; font-size:.97rem; }}
+          .date-pill .date-meta {{ color:var(--text-muted); font-size:.8rem; }}
+          .muted-link {{ border:0; background:transparent; color:var(--text-muted); margin-top:8px; padding:0; cursor:pointer; }}
+          .main-grid {{ display:grid; grid-template-columns:1fr; gap:12px; align-items:start; }}
+          .board {{ background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:14px; }}
+          .board-head {{ display:flex; justify-content:space-between; gap:10px; align-items:flex-start; margin-bottom:10px; }}
+          .board-head h2 {{ margin:0; font-size:1.28rem; }}
+          .board-head span {{ color:var(--text-muted); font-size:.9rem; }}
+          .picks {{ display:grid; grid-template-columns:1fr; gap:10px; }}
+          .pick-card,.empty-card {{ background:var(--panel-2); border:1px solid var(--line); border-radius:12px; padding:12px; }}
+          .pick-head {{ display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; gap:8px; }}
+          .badge {{ display:inline-flex; align-items:center; gap:5px; border-radius:999px; padding:5px 9px; background:var(--green-soft); color:#5fe2af; font-size:.77rem; font-weight:700; }}
+          .badge.top {{ background:rgba(200,169,101,.16); color:#e7cf9a; }}
+          .edge {{ color:#59d8a7; font-weight:700; }}
+          .pick-card h3,.empty-card h3 {{ margin:0 0 7px; font-size:1.08rem; }}
+          .meta {{ margin:0 0 9px; color:var(--text-muted); font-size:.88rem; }}
+          .selection {{ margin:0 0 10px; font-size:.98rem; }}
+          .stats {{ display:flex; flex-wrap:wrap; gap:8px; color:var(--text-muted); font-size:.84rem; }}
+          .side-col {{ display:grid; gap:10px; }}
+          .side-block {{ background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:12px; }}
+          .side-block h3 {{ margin:0 0 8px; font-size:1rem; }}
+          .side-list {{ margin:0; padding:0; list-style:none; display:grid; gap:6px; color:var(--text-muted); font-size:.9rem; }}
+          .side-list strong {{ color:var(--text); font-weight:600; }}
+          .hidden {{ display:none !important; }}
+          @media (min-width:760px) {{
+            .kpi-strip {{ grid-template-columns:repeat(4,minmax(0,1fr)); }}
+            .toolbar {{ grid-template-columns:1fr auto; }}
+            .date-strip {{ grid-template-columns:repeat(3,minmax(0,1fr)); }}
           }}
-          .hero {{
-            display: grid;
-            gap: 10px;
-            margin-bottom: 16px;
+          @media (min-width:1080px) {{
+            .main-grid {{ grid-template-columns:minmax(0,2.1fr) minmax(300px,1fr); }}
+            .picks {{ grid-template-columns:repeat(2,minmax(0,1fr)); }}
           }}
-          .hero h1 {{
-            margin: 0;
-            font-size: clamp(1.7rem, 7vw, 2.8rem);
-            line-height: 1.05;
-          }}
-          .hero p {{
-            margin: 0;
-            max-width: 760px;
-            color: var(--muted);
-            font-size: 0.97rem;
-          }}
-          .actions {{
-            display: flex;
-            flex-wrap: wrap;
-            gap: 8px;
-          }}
-          .actions a {{
-            text-decoration: none;
-            color: var(--ink);
-            padding: 9px 12px;
-            border-radius: 999px;
-            border: 1px solid var(--line);
-            background: rgba(255, 255, 255, 0.72);
-            font-size: 0.9rem;
-          }}
-          .actions a.primary {{
-            background: var(--accent);
-            color: white;
-            border-color: var(--accent);
-          }}
-          .actions a:focus-visible, .date-pill:focus-visible {{
-            outline: 2px solid var(--accent);
-            outline-offset: 2px;
-          }}
-          .stats-grid {{
-            display: grid;
-            grid-template-columns: 1fr;
-            gap: 10px;
-            margin: 14px 0 18px;
-          }}
-          .stat {{
-            background: var(--card);
-            border: 1px solid var(--line);
-            border-radius: 14px;
-            padding: 14px 15px;
-          }}
-          .stat .label {{
-            color: var(--muted);
-            font-size: 0.9rem;
-          }}
-          .stat .value {{
-            margin-top: 6px;
-            font-size: 1.7rem;
-            font-weight: 700;
-          }}
-          section {{
-            background: rgba(255, 255, 255, 0.35);
-            border: 1px solid #e4dbca;
-            border-radius: 18px;
-            padding: 14px;
-            margin-bottom: 14px;
-          }}
-          .section-head {{
-            display: flex;
-            justify-content: space-between;
-            align-items: flex-start;
-            flex-direction: column;
-            gap: 16px;
-            margin-bottom: 10px;
-          }}
-          .section-head h2 {{
-            margin: 0;
-            font-size: 1.35rem;
-          }}
-          .section-head span {{
-            color: var(--muted);
-            font-size: 0.88rem;
-          }}
-          .date-strip {{
-            display: grid;
-            grid-template-columns: 1fr;
-            gap: 8px;
-            margin-bottom: 10px;
-          }}
-          .date-pill {{
-            display: flex;
-            flex-direction: column;
-            gap: 2px;
-            min-width: 0;
-            padding: 10px 12px;
-            border-radius: 12px;
-            border: 1px solid var(--line);
-            background: rgba(255, 255, 255, 0.78);
-            color: var(--ink);
-            cursor: pointer;
-            text-align: left;
-            transition: transform 120ms ease, border-color 120ms ease, background 120ms ease;
-          }}
-          .date-pill:hover {{
-            transform: translateY(-1px);
-            border-color: #b9af98;
-          }}
-          .date-pill.active {{
-            background: var(--accent);
-            border-color: var(--accent);
-            color: white;
-          }}
-          .date-pill .date-label {{
-            font-weight: 700;
-            font-size: 0.98rem;
-          }}
-          .date-pill .date-meta {{
-            font-size: 0.82rem;
-            opacity: 0.82;
-          }}
-          .picks {{
-            display: grid;
-            grid-template-columns: 1fr;
-            gap: 10px;
-          }}
-          .pick-card, .empty-card {{
-            background: var(--card);
-            border: 1px solid var(--line);
-            border-radius: 14px;
-            padding: 14px;
-            box-shadow: 0 10px 20px rgba(23, 34, 31, 0.04);
-          }}
-          .pick-head {{
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            gap: 8px;
-            margin-bottom: 12px;
-          }}
-          .badge {{
-            display: inline-flex;
-            align-items: center;
-            padding: 6px 10px;
-            border-radius: 999px;
-            background: var(--accent-soft);
-            color: #0e6f52;
-            font-size: 0.8rem;
-            font-weight: 700;
-            letter-spacing: 0.04em;
-          }}
-          .edge {{
-            font-weight: 700;
-            color: var(--accent);
-          }}
-          .pick-card h3, .empty-card h3 {{
-            margin: 0 0 8px;
-            font-size: 1.15rem;
-            line-height: 1.15;
-          }}
-          .meta {{
-            margin: 0 0 12px;
-            color: var(--muted);
-            font-size: 0.92rem;
-          }}
-          .selection {{
-            margin: 0 0 14px;
-            font-size: 1rem;
-          }}
-          .stats {{
-            display: flex;
-            flex-wrap: wrap;
-            gap: 10px;
-            color: var(--muted);
-            font-size: 0.9rem;
-          }}
-          .toolbar {{
-            display: grid;
-            grid-template-columns: 1fr;
-            gap: 8px;
-            align-items: stretch;
-            margin-bottom: 10px;
-          }}
-          .toolbar input[type="date"] {{
-            width: 100%;
-            padding: 11px 12px;
-            border-radius: 10px;
-            border: 1px solid var(--line);
-            background: rgba(255, 255, 255, 0.9);
-            color: var(--ink);
-            font: inherit;
-          }}
-          .toolbar button {{
-            width: 100%;
-            padding: 11px 14px;
-            border-radius: 10px;
-            border: 1px solid var(--accent);
-            background: var(--accent);
-            color: white;
-            font-weight: 700;
-            font: inherit;
-            cursor: pointer;
-          }}
-          .toolbar button:disabled {{ opacity: 0.6; cursor: not-allowed; }}
-          .top-board {{
-            border: 1px solid #d6cebd;
-            background: #fffdf8;
-          }}
-          .status-line {{
-            color: var(--muted);
-            font-size: 0.88rem;
-            margin-bottom: 8px;
-          }}
-          .muted-link {{
-            border: none;
-            background: transparent;
-            color: var(--muted);
-            padding: 4px 2px;
-            font-size: 0.84rem;
-            text-align: left;
-            cursor: pointer;
-          }}
-          .hidden {{
-            display: none !important;
-          }}
-          code {{
-            padding: 0.15rem 0.35rem;
-            border-radius: 6px;
-            background: #efe8da;
-          }}
-          @media (min-width: 700px) {{
-            .wrap {{ padding: 28px 20px 42px; }}
-            .stats-grid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
-            .date-strip {{ grid-template-columns: repeat(3, minmax(0, 1fr)); }}
-            .section-head {{ flex-direction: row; align-items: center; }}
-            .toolbar {{ grid-template-columns: 1fr auto; }}
-            .toolbar button {{ width: auto; min-width: 220px; }}
-            .picks {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
-          }}
-          @media (min-width: 1024px) {{
-            .stats-grid {{ grid-template-columns: repeat(4, minmax(0, 1fr)); }}
-            .picks {{ grid-template-columns: repeat(3, minmax(0, 1fr)); }}
-            section {{ padding: 20px; }}
-            .stat {{ padding: 16px 18px; }}
-            .pick-card, .empty-card {{ padding: 16px; }}
-          }}
-          @media (min-width: 1280px) {{
-            .picks {{ grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }}
-            .date-strip {{ grid-template-columns: repeat(4, minmax(0, 1fr)); }}
-            .hero {{
-              grid-template-columns: minmax(0, 1.4fr) minmax(320px, 1fr);
-              align-items: start;
-            }}
-            .hero .actions {{
-              justify-content: flex-end;
-              align-content: flex-start;
-            }}
+          @media (min-width:1320px) {{
+            .picks {{ grid-template-columns:repeat(3,minmax(0,1fr)); }}
+            .shell {{ padding-top:24px; }}
           }}
         </style>
       </head>
       <body>
-        <main class="wrap">
-          <section class="hero">
-            <h1>Today’s Football Picks, At a Glance</h1>
-            <p>
-              Pick a date, refresh the run when needed, and follow the strongest selections in one clear view.
-              You’ll see coverage, prediction readiness, and top picks without digging through raw API output.
-            </p>
-            <div class="actions">
-              <a id="top-json-link" class="primary" href="/board?date={today}">Readable Board</a>
-              <a id="all-json-link" href="/matchday?date={today}">Readable Matchday</a>
-              <a id="fixtures-json-link" href="/fixtures-view?date={today}">Readable Fixtures</a>
-              <a id="summary-json-link" href="/summary?date={today}">Readable Summary</a>
+        <main class="shell">
+          <header class="topnav">
+            <div class="brand">SUMMAS<span class="dot">.</span> Analytics</div>
+            <nav class="nav-links">
+              <a id="top-json-link" class="primary" href="/board?date={today}">Board</a>
+              <a id="all-json-link" href="/matchday?date={today}">Matchday</a>
+              <a id="fixtures-json-link" href="/fixtures-view?date={today}">Fixtures</a>
+              <a id="summary-json-link" href="/summary?date={today}">Summary</a>
               <a href="/docs">API Docs</a>
-              <a href="/status">System Status</a>
-            </div>
+            </nav>
+          </header>
+
+          <section class="context">
+            <h1>Daily Analyst Board</h1>
+            <p id="context-line">Premium matchday opportunities for your active selected date.</p>
           </section>
 
-          <section class="stats-grid">
-            <div class="stat">
-              <div class="label">Upcoming matches (next 7 days)</div>
-              <div class="value">{fixture_count}</div>
-            </div>
-            <div class="stat">
-              <div class="label">Predictions saved (next 7 days)</div>
-              <div class="value">{prediction_count}</div>
-            </div>
-            <div class="stat">
-              <div class="label">Teams in database</div>
-              <div class="value">{team_count}</div>
-            </div>
-            <div class="stat">
-              <div class="label">Version</div>
-              <div class="value">{escape(APP_VERSION)}</div>
-            </div>
+          <section class="kpi-strip">
+            <article class="kpi"><div class="label">Upcoming matches (7 days)</div><div class="value">{fixture_count}</div></article>
+            <article class="kpi"><div class="label">Predicted fixtures (7 days)</div><div class="value">{prediction_count}</div></article>
+            <article class="kpi"><div class="label">Tracked clubs</div><div class="value">{team_count}</div></article>
+            <article class="kpi"><div class="label">Saved board dates</div><div class="value">{len(available_dates)}</div></article>
           </section>
 
-          <section>
-            <div class="section-head">
-              <h2>Choose a match day</h2>
-              <span id="current-date-label">Loading dates...</span>
+          <section class="control">
+            <div class="control-head">
+              <h2>Matchday controls</h2>
+              <span id="current-date-label">Loading date context...</span>
             </div>
             <div class="toolbar">
               <input id="date-input" type="date" value="{today}" />
-              <button id="run-date-btn" type="button">Refresh this date</button>
+              <button id="run-date-btn" type="button">Run Selected Date</button>
             </div>
-            <p id="status-line" class="status-line">Checking the latest matches and predictions...</p>
+            <p id="status-line" class="status-line">Preparing your board...</p>
             <div id="date-strip" class="date-strip">
-              <article class="empty-card">
-                <h3>Loading dates</h3>
-                <p>We’re preparing your available dates.</p>
-              </article>
+              <article class="empty-card"><h3>Loading dates</h3><p>Preparing available matchdays.</p></article>
             </div>
             <button id="toggle-dates-btn" class="muted-link hidden" type="button">View more dates</button>
           </section>
 
-          <section class="top-board">
-            <div class="section-head">
-              <h2>Top 20 picks</h2>
-              <span id="top-picks-caption">Best available picks for the selected date</span>
-            </div>
-            <div id="picks" class="picks">
-              <article class="empty-card">
-                <h3>Loading picks</h3>
-                <p>Finding the strongest options for this date.</p>
+          <section class="main-grid">
+            <article class="board">
+              <div class="board-head">
+                <h2>Top opportunities</h2>
+                <span id="top-picks-caption">Best picks for your selected date</span>
+              </div>
+              <div id="picks" class="picks">
+                <article class="empty-card"><h3>Loading opportunities</h3><p>Gathering today’s strongest board candidates.</p></article>
+              </div>
+            </article>
+            <aside class="side-col">
+              <article class="side-block">
+                <h3>Selected date overview</h3>
+                <ul class="side-list" id="side-overview">
+                  <li><strong>Date:</strong> <span id="side-date">{today}</span></li>
+                  <li><strong>Fixtures:</strong> <span id="side-fixtures">—</span></li>
+                  <li><strong>Predicted:</strong> <span id="side-predicted">—</span></li>
+                  <li><strong>Ranked picks:</strong> <span id="side-ranked">—</span></li>
+                </ul>
               </article>
-            </div>
+              <article class="side-block">
+                <h3>What you can do</h3>
+                <ul class="side-list">
+                  <li>Select a date and run the refresh once.</li>
+                  <li>Review top opportunities in the board.</li>
+                  <li>Open detailed views from the top navigation.</li>
+                </ul>
+              </article>
+            </aside>
           </section>
         </main>
         <script>
           const initialToday = {today!r};
           const initialDates = {available_dates!r};
+          const storageKey = "summas.activeDate";
           const refreshMs = 30000;
 
           const dateStrip = document.getElementById("date-strip");
@@ -1980,6 +2010,10 @@ def _render_homepage(db: Session):
           const fixturesJsonLink = document.getElementById("fixtures-json-link");
           const summaryJsonLink = document.getElementById("summary-json-link");
           const topPicksCaption = document.getElementById("top-picks-caption");
+          const sideDate = document.getElementById("side-date");
+          const sideFixtures = document.getElementById("side-fixtures");
+          const sidePredicted = document.getElementById("side-predicted");
+          const sideRanked = document.getElementById("side-ranked");
 
           let currentDate = initialToday;
           let availableDates = initialDates;
@@ -2015,10 +2049,15 @@ def _render_homepage(db: Session):
             if (!Array.isArray(dateRows) || dateRows.length === 0) {{
               return initialToday;
             }}
+            const isKnownDate = (value) => Boolean(value) && dateRows.some((item) => item.date === value);
 
             const queryDate = new URLSearchParams(window.location.search).get("date");
-            if (queryDate) {{
+            if (isKnownDate(queryDate)) {{
               return queryDate;
+            }}
+            const storedDate = window.localStorage ? window.localStorage.getItem(storageKey) : null;
+            if (isKnownDate(storedDate)) {{
+              return storedDate;
             }}
 
             const exactToday = dateRows.find((item) => item.date === initialToday);
@@ -2032,6 +2071,12 @@ def _render_homepage(db: Session):
             }}
 
             return dateRows[0].date;
+          }}
+
+          function persistActiveDate(value) {{
+            if (window.localStorage && value) {{
+              window.localStorage.setItem(storageKey, value);
+            }}
           }}
 
           function renderDateStrip(dateRows) {{
@@ -2070,7 +2115,7 @@ def _render_homepage(db: Session):
                 <article class="empty-card">
                   <h3>No picks yet for ${{escapeHtml(currentDate)}}</h3>
                   <p>${{note}}</p>
-                  <p class="meta">Try refreshing this date to pull matches and generate fresh picks.</p>
+                  <p class="meta">Try running this selected date to pull fresh fixtures and predictions.</p>
                 </article>
               `;
               return;
@@ -2079,7 +2124,7 @@ def _render_homepage(db: Session):
             picksNode.innerHTML = payload.picks.map((pick) => `
               <article class="pick-card">
                 <div class="pick-head">
-                  <span class="badge">${{escapeHtml((pick.confidence || "medium").toUpperCase())}}</span>
+                  <span class="badge ${{pick.rank === 1 ? "top" : ""}}">${{pick.rank === 1 ? "TOP RANK" : escapeHtml((pick.confidence || "medium").toUpperCase())}}</span>
                   <span class="edge">${{pick.edge >= 0 ? "+" : ""}}${{formatPercent(pick.edge)}} edge</span>
                 </div>
                 <h3>${{escapeHtml(pick.match)}}</h3>
@@ -2113,23 +2158,27 @@ def _render_homepage(db: Session):
             availableDates = Array.isArray(payload?.dates) ? payload.dates : [];
             if (preferredDate) {{
               currentDate = preferredDate;
-            }} else if (!availableDates.some((item) => item.date === currentDate)) {{
+            }} else if (!currentDate) {{
               currentDate = chooseInitialDate(availableDates);
             }}
             dateInput.value = currentDate;
             renderDateStrip(availableDates);
             updateLinks(currentDate);
+            persistActiveDate(currentDate);
+            sideDate.textContent = currentDate;
             currentDateLabel.textContent = availableDates.length
-              ? `Showing ${{currentDate}}`
+              ? `Active selected date: ${{currentDate}}`
               : "No stored match dates yet";
           }}
 
           async function loadDate(dateValue, refreshDatesFirst = true) {{
-            currentDate = dateValue || initialToday;
+            currentDate = dateValue || currentDate || initialToday;
             dateInput.value = currentDate;
             updateLinks(currentDate);
-            statusLine.textContent = `Refreshing picks for ${{currentDate}}...`;
-            currentDateLabel.textContent = `Showing ${{currentDate}}`;
+            persistActiveDate(currentDate);
+            statusLine.textContent = `Loading board for ${{currentDate}}...`;
+            currentDateLabel.textContent = `Active selected date: ${{currentDate}}`;
+            sideDate.textContent = currentDate;
             window.history.replaceState(null, "", `/?date=${{encodeURIComponent(currentDate)}}`);
 
             if (refreshDatesFirst) {{
@@ -2172,14 +2221,17 @@ def _render_homepage(db: Session):
               : `No saved picks yet for ${{currentDate}}`;
 
             const summary = availableDates.find((item) => item.date === currentDate);
+            sideFixtures.textContent = String(daySummary?.unique_fixtures ?? summary?.fixtures ?? 0);
+            sidePredicted.textContent = String(daySummary?.predicted_fixtures ?? summary?.predictions ?? 0);
+            sideRanked.textContent = String(daySummary?.ranked_picks ?? payload?.count ?? 0);
             if (daySummary) {{
-              statusLine.textContent = `Live for ${{currentDate}}: ${{daySummary.raw_fixtures ?? 0}} collected, ${{daySummary.analyzable_fixtures ?? 0}} ready to analyze, ${{daySummary.predicted_fixtures ?? 0}} with predictions, ${{daySummary.ranked_picks ?? 0}} on the board. Auto-refresh every 30 seconds.`;
+              statusLine.textContent = `For ${{currentDate}}: ${{daySummary.unique_fixtures ?? 0}} fixtures, ${{daySummary.predicted_fixtures ?? 0}} predicted fixtures, ${{daySummary.ranked_picks ?? 0}} ranked picks.`;
             }} else if (summary) {{
-              statusLine.textContent = `Using saved data: ${{summary.fixtures}} matches and ${{summary.predictions}} predicted fixtures for ${{currentDate}}. Auto-refresh every 30 seconds.`;
+              statusLine.textContent = `Using saved data for ${{currentDate}}: ${{summary.fixtures}} fixtures and ${{summary.predictions}} predicted fixtures.`;
             }} else if (payload.note) {{
               statusLine.textContent = payload.note;
             }} else {{
-              statusLine.textContent = `No saved picks for ${{currentDate}} yet. Auto-refresh every 30 seconds.`;
+              statusLine.textContent = `No saved picks yet for ${{currentDate}}.`;
             }}
           }}
 
@@ -2208,6 +2260,7 @@ def _render_homepage(db: Session):
             const targetDate = dateInput.value || currentDate || initialToday;
             currentDate = targetDate;
             updateLinks(currentDate);
+            persistActiveDate(currentDate);
             setBusyState(true);
             runInFlightDates.add(currentDate);
             statusLine.textContent = `Refreshing matches and predictions for ${{currentDate}}...`;
@@ -2224,7 +2277,7 @@ def _render_homepage(db: Session):
                 const created = payload?.results?.predictions_created ?? 0;
                 const analyzable = payload?.collection?.analyzable_fixtures ?? 0;
                 const ranked = payload?.collection?.ranked_picks ?? 0;
-                statusLine.textContent = `Done for ${{currentDate}}: ${{scraped}} matches collected, ${{analyzable}} ready to analyze, ${{created}} predictions saved, and ${{ranked}} picks on the board.`;
+                statusLine.textContent = `Updated ${{currentDate}}: ${{scraped}} fixtures collected, ${{created}} predictions generated, ${{ranked}} ranked picks ready.`;
               }}
             }} catch (error) {{
               statusLine.textContent = `Couldn’t refresh ${{currentDate}}: ${{error.message || "Unknown error"}}`;
@@ -2244,6 +2297,9 @@ def _render_homepage(db: Session):
             loadDate(dateInput.value, true);
           }});
 
+          currentDate = chooseInitialDate(initialDates);
+          dateInput.value = currentDate;
+          persistActiveDate(currentDate);
           refreshDashboard();
           refreshHandle = window.setInterval(refreshDashboard, refreshMs);
           window.addEventListener("beforeunload", () => {{
@@ -2807,6 +2863,41 @@ def debug_source_status(
     }
 
 
+@app.get("/debug/public-web/adapter-health")
+def debug_public_web_adapter_health(
+    history_limit: int = Query(200, ge=10, le=2000),
+    db: Session = Depends(get_db),
+):
+    from utils.browser_sources import provider_health_snapshot
+
+    snapshot = provider_health_snapshot()
+    history_rows = (
+        db.query(PublicWebProviderHealthEvent)
+        .order_by(PublicWebProviderHealthEvent.created_at.desc())
+        .limit(history_limit)
+        .all()
+    )
+    return {
+        "mode": "read_only_debug",
+        "source": "public_web",
+        "providers_tracked": len(snapshot),
+        "provider_health": snapshot,
+        "persisted_history_count": len(history_rows),
+        "persisted_history": [
+            {
+                "provider_key": row.provider_key,
+                "adapter_name": row.adapter_name,
+                "provider_name": row.provider_name,
+                "event": row.event,
+                "requested_date": row.requested_date,
+                "detail": row.detail,
+                "created_at": row.created_at.isoformat() if row.created_at else None,
+            }
+            for row in history_rows
+        ],
+    }
+
+
 @app.get("/debug/decision-engine/compare")
 def debug_decision_engine_compare(
     match_date: Optional[calendar_date] = Query(None, alias="date", description="Day in YYYY-MM-DD format; defaults to today"),
@@ -2827,6 +2918,10 @@ def debug_decision_engine_compare(
     report = {
         "mode": "read_only_engine_compare",
         "requested_date": requested_date.isoformat(),
+        "applied_filters": {
+            "limit": resolved_limit,
+            "min_edge": resolved_min_edge,
+        },
         "config": {
             "enable_calibrated_decision_engine": bool(ENABLE_CALIBRATED_DECISION_ENGINE),
             "calibrated_engine_min_market_samples": CALIBRATED_ENGINE_MIN_MARKET_SAMPLES,
@@ -2839,6 +2934,14 @@ def debug_decision_engine_compare(
             "calibrated_count": len(calibrated_picks),
             "legacy_avg_confidence_score": round(sum(item.get("confidence_score", 0.0) for item in legacy) / len(legacy), 3) if legacy else 0.0,
             "calibrated_avg_confidence_score": round(sum(item.get("confidence_score", 0.0) for item in calibrated_picks) / len(calibrated_picks), 3) if calibrated_picks else 0.0,
+            "legacy_edge_range": {
+                "min": round(min((float(item.get("edge", 0.0)) for item in legacy), default=0.0), 4),
+                "max": round(max((float(item.get("edge", 0.0)) for item in legacy), default=0.0), 4),
+            },
+            "calibrated_edge_range": {
+                "min": round(min((float(item.get("edge", 0.0)) for item in calibrated_picks), default=0.0), 4),
+                "max": round(max((float(item.get("edge", 0.0)) for item in calibrated_picks), default=0.0), 4),
+            },
             "engine_path": calibrated.get("engine_path", "calibrated_engine"),
             "fallback_reason": calibrated.get("fallback_reason"),
         },
