@@ -94,6 +94,19 @@ class PredictionsTodayResponse(BaseModel):
     predictions: List[MatchPredictionsResponse]
 
 
+
+
+class PerformanceSummaryResponse(BaseModel):
+    total: int
+    wins: int
+    losses: int
+    void_count: int
+    pending_count: int
+    settled_count: int
+    win_rate: float
+    win_rate_settled: float
+
+
 class TopPredictionResponse(BaseModel):
     fixture_id: int
     fixture_key: Optional[str] = None
@@ -129,6 +142,8 @@ class TopPredictionResponse(BaseModel):
     expected_away_goals: Optional[float] = None
     main_reasons: List[str] = []
     risk_notes: List[str] = []
+    result_score: Optional[str] = None
+    status: Optional[str] = "pending"
 
 
 class TopPredictionsListResponse(BaseModel):
@@ -136,6 +151,7 @@ class TopPredictionsListResponse(BaseModel):
     requested_date: Optional[str] = None
     note: Optional[str] = None
     available_dates: List[str] = []
+    performance: PerformanceSummaryResponse
     picks: List[TopPredictionResponse]
 
 
