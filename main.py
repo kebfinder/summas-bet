@@ -87,6 +87,7 @@ from services.fixture_enrichment import enrich_fixtures, summarize_enrichment
 from services.decision_preview import preview_for_enriched_fixture
 from services.decision_backtest import resolve_market_outcome, run_backtest_with_calibration_comparison
 from services.preview_calibration import CalibrationConfig, select_best_candidate_with_calibration
+from services.result_evaluator import compute_performance, evaluate_prediction
 from utils.competitions import is_competition_admitted, resolve_competition
 from utils.football import (
     clamp,
@@ -1768,7 +1769,7 @@ def _serialize_match_predictions(fixture: Fixture, predictions: List[Prediction]
 
 def _serialize_top_prediction(prediction: Prediction, details: dict):
     fixture = prediction.fixture
-    return {
+    payload = {
         "fixture_id": prediction.fixture_id,
         "match": f"{fixture.home.name} vs {fixture.away.name}" if fixture and fixture.home and fixture.away else "Unknown",
         "league": fixture.league if fixture else None,
@@ -1790,6 +1791,15 @@ def _serialize_top_prediction(prediction: Prediction, details: dict):
         "main_reasons": details["main_reasons"],
         "risk_notes": details["risk_notes"],
     }
+
+    if fixture and fixture.home_goals is not None and fixture.away_goals is not None:
+        payload["status"] = evaluate_prediction(prediction.market, prediction.selection, fixture.home_goals, fixture.away_goals)
+        payload["result_score"] = f"{fixture.home_goals}-{fixture.away_goals}"
+    else:
+        payload["status"] = "pending"
+        payload["result_score"] = None
+
+    return payload
 
 
 def _top_predictions_from_fixtures(
@@ -2018,6 +2028,10 @@ def _render_homepage(db: Session):
         <link rel="stylesheet" href="/static/dashboard.css" />
       </head>
       <body>
+        <nav class="top-bar">
+          <div class="brand"><div class="brand-icon">S</div><div class="brand-text">SUMMAS <span>Analyst Desk</span></div></div>
+          <div class="system-status"><span class="status-item"><span class="status-dot"></span>Live Feed</span><span class="model-badge">Model <strong>v2</strong></span></div>
+        </nav>
         <main class="wrap">
           <section class="hero">
             <h1>SUMMAS Analyst Desk</h1>
@@ -2035,21 +2049,11 @@ def _render_homepage(db: Session):
           </section>
 
           <section class="stats-grid">
-            <div class="stat">
-              <div class="label">Scheduled matches · next 7 days</div>
-              <div class="value">{fixture_count}</div>
-            </div>
-            <div class="stat emphasis">
-              <div class="label">Predictions on file · next 7 days</div>
-              <div class="value">{prediction_count}</div>
-            </div>
-            <div class="stat">
-              <div class="label">Tracked teams</div>
-              <div class="value">{team_count}</div>
-            </div>
-            <div class="stat">
-              <div class="label">Coverage ratio</div>
-              <div class="value">{coverage_ratio:.0f}%</div>
+            <div class="stats">
+              <div class="stat-card">📅 {fixture_count} Matches</div>
+              <div class="stat-card">🎯 {prediction_count} Predictions</div>
+              <div class="stat-card">👥 {team_count} Teams</div>
+              <div class="stat-card">📊 {coverage_ratio:.0f}% Coverage</div>
             </div>
           </section>
 
@@ -2076,6 +2080,7 @@ def _render_homepage(db: Session):
             <div class="section-head">
               <h2>Top 20 opportunities</h2>
               <span id="top-picks-caption">Highest-ranked opportunities for the selected date</span>
+              <span id="performance-summary" class="performance-summary">Win Rate: 0.0% · Wins: 0 | Losses: 0 | Pending: 0</span>
               <div class="actions">
                 <button id="compare-toggle" class="pill" type="button">Comparison: OFF</button>
               </div>
@@ -2090,8 +2095,8 @@ def _render_homepage(db: Session):
               <strong>Comparison</strong>
               <div id="compare-grid" class="compare-grid"></div>
             </div>
-            <div class="calc">
-              <strong>Stake/Odds Calculator</strong>
+            <div class="calc calculator">
+              <h3>🧮 Quick Bet Calculator</h3>
               <div class="filters" style="margin-top:8px;">
                 <input id="calc-stake" type="number" min="0" step="0.01" placeholder="Stake" />
                 <input id="calc-odds" type="number" min="1" step="0.01" placeholder="Odds" />
@@ -2306,6 +2311,10 @@ def _layout_shell(title: str, body: str) -> str:
         </style>
       </head>
       <body>
+        <nav class="top-bar">
+          <div class="brand"><div class="brand-icon">S</div><div class="brand-text">SUMMAS <span>Analyst Desk</span></div></div>
+          <div class="system-status"><span class="status-item"><span class="status-dot"></span>Live Feed</span><span class="model-badge">Model <strong>v2</strong></span></div>
+        </nav>
         <main class="wrap">
           {body}
         </main>
@@ -3024,6 +3033,7 @@ def get_top_predictions(
                     f"engine_path={calibrated.get('engine_path', 'calibrated_engine')}"
                 ),
                 "available_dates": _available_date_labels(db, predicted_only=True) if not calibrated_picks else [],
+                "performance": compute_performance(calibrated_picks),
                 "picks": calibrated_picks,
             }
         engine_path = "calibrated_engine_fallback_to_legacy"
@@ -3063,12 +3073,14 @@ def get_top_predictions(
         note = f"engine_mode={engine_mode}; {note}"
     else:
         note = f"engine_mode={engine_mode}"
+    serialized_picks = [_serialize_top_prediction(prediction, details) for prediction, details in picks]
     return {
         "count": len(picks),
         "requested_date": _requested_date_value(match_date),
         "note": note,
         "available_dates": _available_date_labels(db, predicted_only=True) if not picks else [],
-        "picks": [_serialize_top_prediction(prediction, details) for prediction, details in picks],
+        "performance": compute_performance(serialized_picks),
+        "picks": serialized_picks,
     }
 
 

@@ -35,10 +35,36 @@ let refreshInFlight = false;
 let compareMode = false;
 const selectedForCompare = new Set();
 let cachedPicks = [];
+let cachedPerformance = null;
 
 const escapeHtml = (value) => String(value ?? "").replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
 const formatPercent = (value) => `${(Number(value ?? 0) * 100).toFixed(1)}%`;
 const stars = (n) => "★".repeat(Math.max(0, Math.min(5, Number(n || 0)))) + "☆".repeat(5 - Math.max(0, Math.min(5, Number(n || 0))));
+
+function getRiskLabel(tier) {
+  if (!tier) return "Unknown";
+  const t = String(tier).toLowerCase();
+  if (t.includes("safe")) return "🟢 Safe";
+  if (t.includes("balanced")) return "🟡 Balanced";
+  if (t.includes("bold") || t.includes("high")) return "🔴 Bold";
+  return tier;
+}
+
+function cleanText(label, value, fallback) {
+  const text = String(value || "");
+  if (!text || text.toLowerCase().includes("unavailable")) {
+    return `${label}: ${fallback}`;
+  }
+  return `${label}: ${value}`;
+}
+
+function getResultLabel(status) {
+  const normalized = String(status || "pending").toLowerCase();
+  if (normalized === "won") return "✅ WON";
+  if (normalized === "lost") return "❌ LOST";
+  return "⏳ PENDING";
+}
+
 
 function updateLinks(dateValue) {
   const encoded = encodeURIComponent(dateValue);
@@ -85,15 +111,25 @@ function renderCompare(filtered) {
   }
   const selected = [...selectedForCompare].map((i) => filtered[Number(i)]).filter(Boolean);
   comparePanel?.classList.remove("hidden");
-  if (compareGrid) compareGrid.innerHTML = selected.map((p)=>`<article class="empty-card"><h3>${escapeHtml(p.match)}</h3><p class="meta">${escapeHtml(p.market)} ${escapeHtml(p.selection||"")}</p><p class="meta">Prob ${p.probability_pct || 0}% | ${stars(p.confidence_stars)} | ${escapeHtml(p.risk_tier || "Unavailable")}</p><p class="meta">Value: ${escapeHtml(p.value_status || "Odds unavailable")}</p><p class="meta">${escapeHtml(p.explanation || "Not available from current data source")}</p></article>`).join("");
+  if (compareGrid) compareGrid.innerHTML = selected.map((p)=>`<article class="empty-card"><h3>${escapeHtml(p.match)}</h3><p class="meta">${escapeHtml(p.market)} ${escapeHtml(p.selection||"")}</p><p class="meta">Prob ${p.probability_pct || 0}% | ${stars(p.confidence_stars)} | ${escapeHtml(getRiskLabel(p.risk_tier))}</p><p class="meta">Value: ${escapeHtml(p.value_status || "Odds unavailable")}</p><p class="meta">${escapeHtml(p.explanation || "Not available from current data source")}</p></article>`).join("");
+}
+
+
+function renderPerformanceSummary(performance) {
+  const existing = document.getElementById("performance-summary");
+  if (!existing || !performance) return;
+  existing.innerHTML = `Win Rate: ${Number(performance.win_rate_settled ?? performance.win_rate ?? 0).toFixed(1)}% · Wins: ${performance.wins ?? 0} | Losses: ${performance.losses ?? 0} | Pending: ${performance.pending_count ?? 0}`;
 }
 
 function renderPicks(payload) {
   if (!payload || !Array.isArray(payload.picks) || !payload.picks.length) {
     picksNode.innerHTML = `<article class="empty-card"><h3>No board entries for ${escapeHtml(currentDate)}</h3><p>${escapeHtml(payload?.note || "No ranked opportunities are stored for this date yet.")}</p></article>`;
+    renderPerformanceSummary(payload?.performance || {win_rate_settled: 0, wins: 0, losses: 0, pending_count: 0});
     return;
   }
   cachedPicks = payload.picks || [];
+  cachedPerformance = payload.performance || cachedPerformance;
+  renderPerformanceSummary(cachedPerformance);
   const leagues = [...new Set(cachedPicks.map((p) => String(p.league || "")).filter(Boolean))];
   if (filterLeague) {
     const prev = filterLeague.value || "all";
@@ -101,7 +137,24 @@ function renderPicks(payload) {
     filterLeague.value = leagues.includes(prev) ? prev : "all";
   }
   const filtered = applyFilters(cachedPicks);
-  picksNode.innerHTML = filtered.map((pick, idx) => `<article class="pick-card" data-index="${idx}" data-confidence="${escapeHtml((pick.confidence || 'medium').toLowerCase())}"><div class="pick-head"><span class="badge">${escapeHtml((pick.confidence_band || pick.confidence || "medium"))}</span><span class="edge">${pick.edge >= 0 ? "+" : ""}${formatPercent(pick.edge)} edge</span></div><h3>${escapeHtml(pick.home_team || "")} vs ${escapeHtml(pick.away_team || "")}</h3><p class="meta">${escapeHtml(pick.league || "Unknown league")} | ${escapeHtml(pick.kickoff || pick.date || "Unavailable")}</p><p class="selection">${escapeHtml(pick.market)}: <strong>${escapeHtml(pick.selection || "")}</strong></p><p class="meta">${stars(pick.confidence_stars)} | Risk: ${escapeHtml(pick.risk_tier || "Unavailable")} | Value: ${escapeHtml(pick.value_status || "Odds unavailable")}</p><div class="prob-track"><div class="prob-fill" style="width:${Math.max(0, Math.min(100, Number(pick.probability_pct || 0)))}%;"></div></div><div class="stats"><span>Prob ${pick.probability_pct ?? (Number(pick.probability||0)*100).toFixed(1)}%</span><span>Stake ${Number(pick.stake ?? 0).toFixed(2)}</span><span>Trend ${escapeHtml(pick.last_5_home || "Unavailable")} / ${escapeHtml(pick.last_5_away || "Unavailable")}</span></div><div class="meta hidden details">${escapeHtml(pick.recent_trend_summary || "Unavailable")}. ${escapeHtml(pick.explanation || "Not available from current data source")}</div></article>`).join("");
+  picksNode.innerHTML = filtered.map((pick, idx) => {
+    const probabilityPct = Number(pick.probability_pct ?? (Number(pick.probability || 0) * 100)).toFixed(1);
+    const edgePct = `${pick.edge >= 0 ? "+" : ""}${formatPercent(pick.edge)}`;
+    const predictionText = `${pick.market || ""}: ${pick.selection || ""}`;
+    const teams = pick.home_team && pick.away_team ? `${pick.home_team} vs ${pick.away_team}` : (pick.match || "Match");
+    const trendValue = `${pick.last_5_home || "Unavailable"} / ${pick.last_5_away || "Unavailable"}`;
+    return `<article class="pick-card match-card" data-index="${idx}" data-confidence="${escapeHtml((pick.confidence || 'medium').toLowerCase())}">
+      <div class="card-header"><span class="teams">${escapeHtml(teams)}</span><span class="risk">${escapeHtml(getRiskLabel(pick.risk_tier))}</span></div>
+      <div class="prediction">${escapeHtml(predictionText)}</div>
+      <div class="metrics"><span class="prob">${probabilityPct}%</span><span class="edge">${escapeHtml(edgePct)}</span></div>
+      <div class="confidence">${stars(pick.confidence_stars || 3)} <span class="band">${escapeHtml(pick.confidence_band || pick.confidence || "")}</span></div>
+      <div class="meta">${escapeHtml(pick.league || "Unknown league")} • ${escapeHtml(pick.kickoff || pick.date || "Unavailable")}</div>
+      <div class="extra">${escapeHtml(cleanText("Trend", trendValue, "No recent data"))}<br/>${escapeHtml(cleanText("Value", pick.value_status, "Odds not provided"))}</div>
+      <div class="prob-track"><div class="prob-fill" style="width:${Math.max(0, Math.min(100, Number(probabilityPct)))}%;"></div></div>
+      <div class="pick-stats"><span>Stake ${Number(pick.stake ?? 0).toFixed(2)}</span><span><span class="result-pill result-${escapeHtml(String(pick.status || "pending").toLowerCase())}">${escapeHtml(getResultLabel(pick.status))}</span></span></div>
+      <div class="meta hidden details">${escapeHtml(pick.recent_trend_summary || "Unavailable")}. ${escapeHtml(pick.explanation || "Not available from current data source")}</div>
+    </article>`;
+  }).join("");
   picksNode.querySelectorAll(".pick-card").forEach((card) => {
     card.addEventListener("click", () => {
       card.querySelector(".details")?.classList.toggle("hidden");
@@ -148,7 +201,7 @@ async function runSelectedDate() {
 }
 
 compareToggle?.addEventListener("click", () => { compareMode = !compareMode; compareToggle.textContent = `Comparison: ${compareMode ? "ON" : "OFF"}`; if(!compareMode){selectedForCompare.clear(); document.querySelectorAll('.pick-card').forEach(c=>c.style.outline='none'); renderCompare([]);} });
-[filterLeague, filterRisk, filterStars, filterValue].forEach((n) => n?.addEventListener("change", () => renderPicks({picks: cachedPicks})));
+[filterLeague, filterRisk, filterStars, filterValue].forEach((n) => n?.addEventListener("change", () => renderPicks({picks: cachedPicks, performance: cachedPerformance})));
 
 function updateCalculator(){ const stake=Number(calcStake?.value||0); const odds=Number(calcOdds?.value||0); const payout=stake*odds; const profit=payout-stake; if(calcOutput) calcOutput.textContent=`Payout = stake × odds = ${payout.toFixed(2)} | Profit = payout − stake = ${profit.toFixed(2)}`; }
 calcStake?.addEventListener("input", updateCalculator); calcOdds?.addEventListener("input", updateCalculator);
