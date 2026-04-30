@@ -96,12 +96,17 @@ class PredictionsTodayResponse(BaseModel):
 
 class TopPredictionResponse(BaseModel):
     fixture_id: int
+    fixture_key: Optional[str] = None
+    home_team: Optional[str] = None
+    away_team: Optional[str] = None
     match: str
     league: Optional[str] = None
     date: str
+    kickoff: Optional[str] = None
     market: str
     selection: str
     probability: float
+    probability_pct: Optional[float] = None
     market_probability: float
     edge: float
     fair_odds: Optional[float] = None
@@ -110,7 +115,16 @@ class TopPredictionResponse(BaseModel):
     confidence: str
     confidence_score: float
     confidence_grade: str
+    confidence_stars: Optional[int] = None
+    confidence_band: Optional[str] = None
+    risk_tier: Optional[str] = None
     odds: Optional[float] = None
+    value_indicator: Optional[float] = None
+    value_status: Optional[str] = None
+    explanation: Optional[str] = None
+    recent_trend_summary: Optional[str] = None
+    last_5_home: Optional[str] = None
+    last_5_away: Optional[str] = None
     expected_home_goals: Optional[float] = None
     expected_away_goals: Optional[float] = None
     main_reasons: List[str] = []
