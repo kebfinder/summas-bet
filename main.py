@@ -1044,6 +1044,51 @@ def _collect_footballdata_bundle(db: Session, match_date: Optional[calendar_date
     }
 
 
+
+
+def _collect_apifootball_bundle(db: Session, match_date: Optional[calendar_date] = None, days_ahead: int = 0):
+    from scrapers.api_football_api import APIFootballAPI
+
+    api_key = os.getenv("API_FOOTBALL_API_KEY") or os.getenv("RAPIDAPI_KEY")
+    if not api_key:
+        status = {
+            "source": "api_football",
+            "failed": True,
+            "missing_api_key": True,
+            "raw_fixtures": 0,
+            "unique_fixtures": 0,
+            "duplicates_removed": 0,
+            "fixtures_visible": 0,
+            "fixture_enrichment_summary": None,
+            "note": "API_FOOTBALL_API_KEY (or RAPIDAPI_KEY) not configured",
+        }
+        return {
+            "source": "api_football",
+            "raw_fixtures": 0,
+            "source_breakdown": {"api_football": 0},
+            "fixtures": [],
+            "note": status["note"],
+            "missing_api_key": True,
+            "source_status": {"api_football": status},
+        }
+
+    scraper = APIFootballAPI(api_key)
+    try:
+        scraped = scraper.get_matches_today(days_ahead=days_ahead, target_date=match_date)
+    finally:
+        scraper.close()
+
+    fixture_ids = _scraped_fixture_ids(scraped)
+    status = _build_source_status("api_football", raw_count=len(scraped), unique_count=len(fixture_ids), missing_api_key=False)
+    return {
+        "source": "api_football",
+        "raw_fixtures": len(scraped),
+        "source_breakdown": {"api_football": len(fixture_ids)},
+        "fixtures": _reload_fixtures_by_ids(db, fixture_ids),
+        "note": "api-football collection completed.",
+        "missing_api_key": False,
+        "source_status": {"api_football": status},
+    }
 def _combine_collection_bundles(db: Session, *bundles):
     fixture_ids = set()
     raw_total = 0
@@ -1078,6 +1123,10 @@ def _collect_fixture_bundle(source: str, db: Session, match_date: Optional[calen
         bundle = _collect_footballdata_bundle(db, match_date=match_date, days_ahead=days_ahead)
         if bundle.get("missing_api_key"):
             raise HTTPException(status_code=400, detail="FOOTBALL_DATA_API_KEY not set")
+    elif normalized_source in {"apifootball", "api-football", "api_football"}:
+        bundle = _collect_apifootball_bundle(db, match_date=match_date, days_ahead=days_ahead)
+        if bundle.get("missing_api_key"):
+            raise HTTPException(status_code=400, detail="API_FOOTBALL_API_KEY (or RAPIDAPI_KEY) not set")
     elif normalized_source in {"public_web", "public-web", "publicweb"}:
         try:
             bundle = _collect_public_web_bundle(db, match_date=match_date, days_ahead=days_ahead)
@@ -2638,7 +2687,7 @@ def get_day_summary(
 
 @app.get("/debug/enrichment")
 def debug_fixture_enrichment(
-    source: str = Query("hybrid", description="Source: hybrid, openligadb, footballdata or public_web"),
+    source: str = Query("hybrid", description="Source: hybrid, openligadb, footballdata, api_football or public_web"),
     match_date: Optional[calendar_date] = Query(None, alias="date", description="Day in YYYY-MM-DD format; defaults to today"),
     sample_limit: int = Query(200, ge=1, le=1000, description="Maximum enriched fixtures to include in the response"),
     db: Session = Depends(get_db),
@@ -2689,6 +2738,8 @@ def debug_source_status(
         "dashboard_auto_collection_via_/run?source=hybrid": True,
     }
     probes["footballdata"]["called_by"] = dict(shared_hybrid_flow)
+    probes["api_football"] = _source_probe_for_date(db, "api_football", requested_date)
+    probes["api_football"]["called_by"] = {"dashboard": "on-demand source via /run?source=api_football"}
     probes["openligadb"]["called_by"] = dict(shared_hybrid_flow)
 
     return {
@@ -2815,7 +2866,7 @@ def debug_decision_engine_mode():
 @app.get("/scrape/today", response_model=ScrapeFixturesResponse)
 @app.post("/scrape/today", response_model=ScrapeFixturesResponse)
 def scrape_today_fixtures(
-    source: str = Query("hybrid", description="Source: hybrid, openligadb, footballdata or public_web"),
+    source: str = Query("hybrid", description="Source: hybrid, openligadb, footballdata, api_football or public_web"),
     match_date: Optional[calendar_date] = Query(None, alias="date", description="Day in YYYY-MM-DD format; defaults to today"),
     db: Session = Depends(get_db),
 ):
@@ -3095,7 +3146,7 @@ def update_team_statistics(db: Session = Depends(get_db)):
 @app.get("/run", response_model=PipelineResponse)
 @app.post("/run", response_model=PipelineResponse)
 def run_full_pipeline(
-    source: str = Query("hybrid", description="Source: hybrid, openligadb, footballdata or public_web"),
+    source: str = Query("hybrid", description="Source: hybrid, openligadb, footballdata, api_football or public_web"),
     match_date: Optional[calendar_date] = Query(None, alias="date", description="Day in YYYY-MM-DD format; defaults to today"),
     db: Session = Depends(get_db),
 ):
