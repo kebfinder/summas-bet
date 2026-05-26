@@ -6,6 +6,7 @@ import os
 import threading
 import time
 import sys
+from contextlib import asynccontextmanager
 from datetime import date as calendar_date, datetime, timedelta
 from html import escape
 from pathlib import Path
@@ -118,7 +119,14 @@ SITE_ACCESS_PASSWORD = os.getenv("SITE_ACCESS_PASSWORD", "").strip()
 SITE_ACCESS_ENABLED = bool(SITE_ACCESS_USERNAME and SITE_ACCESS_PASSWORD)
 PUBLIC_PATHS = {"/healthz"}
 
-app = FastAPI(title="Football Prediction API", version=APP_VERSION)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    Base.metadata.create_all(bind=engine)
+    logger.info("Database tables created")
+    yield
+
+
+app = FastAPI(title="Football Prediction API", version=APP_VERSION, lifespan=lifespan)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 app.add_middleware(
@@ -160,12 +168,6 @@ async def site_access_middleware(request: Request, call_next):
         status_code=401,
         headers={"WWW-Authenticate": 'Basic realm="SUMMAS Test Access"'},
     )
-
-@app.on_event("startup")
-async def startup_event():
-    Base.metadata.create_all(bind=engine)
-    logger.info("Database tables created")
-
 
 class PredictionEngine:
     def __init__(self, db: Session):
