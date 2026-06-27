@@ -417,3 +417,81 @@ def test_public_web_reports_unknown_allowlist_sources(monkeypatch):
     assert status["failed"] is True
     assert "not_real_adapter" in status["unsupported_allowed_sources"]
     assert "Unknown allowlist sources" in (status["failure_reason"] or "")
+
+
+def test_public_web_does_not_cache_empty_or_failed_bundles(monkeypatch):
+    _reset_public_web_state()
+    monkeypatch.setattr(main, "PUBLIC_WEB_CACHE_TTL_SECONDS", 60)
+
+    empty_bundle = {
+        "raw_fixtures": 0,
+        "fixtures": [],
+        "source_status": {"public_web": {"failed": False}},
+    }
+    failed_bundle = {
+        "raw_fixtures": 2,
+        "fixtures": [],
+        "source_status": {"public_web": {"failed": True}},
+    }
+    good_bundle = {
+        "raw_fixtures": 1,
+        "fixtures": [],
+        "source_status": {"public_web": {"failed": False}},
+    }
+
+    main._store_public_web_cached_bundle("empty", empty_bundle)
+    main._store_public_web_cached_bundle("failed", failed_bundle)
+    main._store_public_web_cached_bundle("good", good_bundle)
+
+    assert "empty" not in main._PUBLIC_WEB_BUNDLE_CACHE
+    assert "failed" not in main._PUBLIC_WEB_BUNDLE_CACHE
+    assert "good" in main._PUBLIC_WEB_BUNDLE_CACHE
+
+
+def test_refresh_state_clears_caches_and_expired_fixture_data():
+    _reset_public_web_state()
+    engine = create_engine("sqlite+pysqlite:///:memory:", future=True)
+    SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+    Base.metadata.create_all(bind=engine)
+    db = SessionLocal()
+
+    old_home = main.Team(name="Old Home")
+    old_away = main.Team(name="Old Away")
+    current_home = main.Team(name="Current Home")
+    current_away = main.Team(name="Current Away")
+    db.add_all([old_home, old_away, current_home, current_away])
+    db.flush()
+
+    old_fixture = Fixture(
+        date=main.datetime(2026, 4, 8, 12, 0),
+        home_id=old_home.id,
+        away_id=old_away.id,
+        league="Old League",
+        status="scheduled",
+    )
+    current_fixture = Fixture(
+        date=main.datetime(2026, 4, 9, 12, 0),
+        home_id=current_home.id,
+        away_id=current_away.id,
+        league="Current League",
+        status="scheduled",
+    )
+    db.add_all([old_fixture, current_fixture])
+    db.flush()
+    db.add(main.Prediction(fixture_id=old_fixture.id, market="Over2.5", probability=0.6, edge=0.1, stake=1.0))
+    db.commit()
+
+    main._PUBLIC_WEB_BUNDLE_CACHE["stale"] = (time.time(), {"raw_fixtures": 0})
+    main._PUBLIC_WEB_ADAPTER_COOLDOWNS["adapter"] = time.time() + 60
+    main._MARKET_EVIDENCE_CACHE[("2026-04-09", 120)] = {}
+
+    cache_cleanup = main._clear_runtime_caches()
+    expired_cleanup = main._purge_expired_fixture_data(db, cutoff_date=calendar_date(2026, 4, 9))
+
+    assert cache_cleanup["public_web_bundles"] == 1
+    assert expired_cleanup["expired_fixtures_removed"] == 1
+    assert expired_cleanup["expired_predictions_removed"] == 1
+    assert db.query(Fixture).count() == 1
+    assert db.query(Fixture).first().league == "Current League"
+    assert db.query(main.Prediction).count() == 0
+    db.close()

@@ -119,6 +119,61 @@ SITE_ACCESS_PASSWORD = os.getenv("SITE_ACCESS_PASSWORD", "").strip()
 SITE_ACCESS_ENABLED = bool(SITE_ACCESS_USERNAME and SITE_ACCESS_PASSWORD)
 PUBLIC_PATHS = {"/healthz"}
 
+
+def _clear_runtime_caches() -> dict:
+    """Clear in-memory data that can make collection look stale or empty."""
+    with _PUBLIC_WEB_CACHE_LOCK:
+        public_web_bundles = len(_PUBLIC_WEB_BUNDLE_CACHE)
+        public_web_inflight = len(_PUBLIC_WEB_INFLIGHT)
+        public_web_cooldowns = len(_PUBLIC_WEB_ADAPTER_COOLDOWNS)
+        _PUBLIC_WEB_BUNDLE_CACHE.clear()
+        _PUBLIC_WEB_INFLIGHT.clear()
+        _PUBLIC_WEB_ADAPTER_COOLDOWNS.clear()
+
+    market_evidence = len(_MARKET_EVIDENCE_CACHE)
+    _MARKET_EVIDENCE_CACHE.clear()
+    return {
+        "public_web_bundles": public_web_bundles,
+        "public_web_inflight": public_web_inflight,
+        "public_web_adapter_cooldowns": public_web_cooldowns,
+        "market_evidence": market_evidence,
+    }
+
+
+def _purge_expired_fixture_data(db: Session, cutoff_date: Optional[calendar_date] = None) -> dict:
+    """Remove stale scheduled fixture rows and their predictions before refreshing."""
+    resolved_cutoff = cutoff_date or datetime.now().date()
+    cutoff_start = datetime.combine(resolved_cutoff, datetime.min.time())
+    expired_fixture_ids = [
+        row[0]
+        for row in db.query(Fixture.id)
+        .filter(Fixture.date < cutoff_start)
+        .all()
+    ]
+    if not expired_fixture_ids:
+        return {
+            "cutoff_date": resolved_cutoff.isoformat(),
+            "expired_fixtures_removed": 0,
+            "expired_predictions_removed": 0,
+        }
+
+    expired_predictions_removed = (
+        db.query(Prediction)
+        .filter(Prediction.fixture_id.in_(expired_fixture_ids))
+        .delete(synchronize_session=False)
+    )
+    expired_fixtures_removed = (
+        db.query(Fixture)
+        .filter(Fixture.id.in_(expired_fixture_ids))
+        .delete(synchronize_session=False)
+    )
+    db.commit()
+    return {
+        "cutoff_date": resolved_cutoff.isoformat(),
+        "expired_fixtures_removed": expired_fixtures_removed,
+        "expired_predictions_removed": expired_predictions_removed,
+    }
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
@@ -352,6 +407,9 @@ def _public_web_cached_bundle(cache_key: str) -> Optional[dict]:
 
 def _store_public_web_cached_bundle(cache_key: str, bundle: dict) -> None:
     if PUBLIC_WEB_CACHE_TTL_SECONDS <= 0:
+        return
+    status = (bundle.get("source_status") or {}).get("public_web") or {}
+    if status.get("failed") or int(bundle.get("raw_fixtures", 0) or 0) <= 0:
         return
     with _PUBLIC_WEB_CACHE_LOCK:
         _PUBLIC_WEB_BUNDLE_CACHE[cache_key] = (time.time(), copy.deepcopy(bundle))
@@ -1261,6 +1319,7 @@ def _app_status_payload():
             "/debug/sources/status",
             "/debug/decision-engine/mode",
             "/debug/decision-engine/compare",
+            "/maintenance/refresh-state",
             "/status",
             "/scrape/today",
             "/fixtures",
@@ -1276,6 +1335,19 @@ def _app_status_payload():
 @app.get("/healthz")
 def healthz():
     return {"status": "ok"}
+
+
+@app.post("/maintenance/refresh-state")
+def refresh_runtime_state(
+    cutoff_date: Optional[calendar_date] = Query(None, alias="date", description="Remove fixture rows before this day; defaults to today"),
+    db: Session = Depends(get_db),
+):
+    """Clear runtime caches and remove expired fixture/prediction data."""
+    return {
+        "status": "refreshed",
+        "cache_cleanup": _clear_runtime_caches(),
+        "expired_data_cleanup": _purge_expired_fixture_data(db, cutoff_date=cutoff_date),
+    }
 
 
 def _resolve_requested_date(match_date: Optional[calendar_date]) -> calendar_date:
@@ -2870,12 +2942,16 @@ def debug_decision_engine_mode():
 def scrape_today_fixtures(
     source: str = Query("hybrid", description="Source: hybrid, openligadb, footballdata, api_football or public_web"),
     match_date: Optional[calendar_date] = Query(None, alias="date", description="Day in YYYY-MM-DD format; defaults to today"),
+    refresh: bool = Query(True, description="Clear runtime caches and remove expired fixture rows before scraping"),
     db: Session = Depends(get_db),
 ):
     """
     Scrape fixtures for the requested day.
     """
     requested_date = _resolve_requested_date(match_date)
+    if refresh:
+        _clear_runtime_caches()
+        _purge_expired_fixture_data(db, cutoff_date=requested_date)
     collection_bundle = _collect_fixture_bundle(source, db, match_date=requested_date)
     fixtures = collection_bundle["fixtures"]
     start, end = _resolve_fixture_window(requested_date)
@@ -3150,10 +3226,14 @@ def update_team_statistics(db: Session = Depends(get_db)):
 def run_full_pipeline(
     source: str = Query("hybrid", description="Source: hybrid, openligadb, footballdata, api_football or public_web"),
     match_date: Optional[calendar_date] = Query(None, alias="date", description="Day in YYYY-MM-DD format; defaults to today"),
+    refresh: bool = Query(True, description="Clear runtime caches and remove expired fixture rows before running"),
     db: Session = Depends(get_db),
 ):
     """Run full pipeline for the requested day."""
     requested_date = _resolve_requested_date(match_date)
+    if refresh:
+        _clear_runtime_caches()
+        _purge_expired_fixture_data(db, cutoff_date=requested_date)
     collection_bundle = _collect_fixture_bundle(source, db, match_date=requested_date)
     fixtures = collection_bundle["fixtures"]
     start, end = _resolve_fixture_window(requested_date)
