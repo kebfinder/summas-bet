@@ -46,3 +46,14 @@ def run_engine(fixture):
         "probability": round(final_prob, 3),
         "score": score
     }
+
+
+def get_worldcup2026_live_data():
+    """Return normalized World Cup 2026 live data for engine consumers.
+
+    Kept as a lazy import so the core prediction engine can still start in
+    environments before optional data-layer dependencies are installed.
+    """
+    from engine.worldcup2026_data_layer import get_live_data
+
+    return get_live_data()
