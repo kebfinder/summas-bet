@@ -2,11 +2,19 @@ from engine.features import expected_goals
 from engine.match_model import build_match_context, calibrate_probability
 from engine.poisson_model import probabilities
 from engine.summas_filters import summas_filter
-from engine.self_learning_model import predict
+from engine.self_learning_model import predict, extract_features_from_context
 from sqlalchemy.orm import object_session
 from utils.football import clamp
 
 def run_engine(fixture):
+    """Run the complete prediction engine for a fixture.
+    
+    Args:
+        fixture: Fixture object with home, away, date, league attributes
+    
+    Returns:
+        Dict with prediction result or None if filtered out
+    """
 
     home = fixture.home
     away = fixture.away
@@ -36,7 +44,10 @@ def run_engine(fixture):
     if not score:
         return None
 
-    ml_prob = predict([home.avg_scored, away.avg_scored]) if min(home.matches_played or 0, away.matches_played or 0) >= 8 else 0.5
+    # HIGH FIX (F3): Use rich feature extraction instead of 2 dummy features
+    # Extract meaningful features from the full prediction context
+    features = extract_features_from_context(context)
+    ml_prob = predict(features) if min(home.matches_played or 0, away.matches_played or 0) >= 8 else 0.5
 
     final_prob = (0.75 * probs["over15"]) + (0.15 * probs["btts"]) + (0.10 * ml_prob)
 
