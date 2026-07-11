@@ -192,10 +192,16 @@ def preview_for_enriched_fixture(enriched: dict) -> dict:
             "note": "Available enrichment did not cross preview thresholds.",
         }
 
-    low_confidence_floor = completeness in {"partial", "missing"}
-    if low_confidence_floor:
+    # HIGH FIX (F6): Apply completeness penalty PROPORTIONALLY, not as floor.
+    # Previously: masked ALL high/medium signals when enrichment was partial.
+    # Now: reduce confidence by a small penalty that preserves strong signals.
+    if completeness in {"partial", "missing"}:
+        penalty = 0.10 if completeness == "partial" else 0.15  # Reduce by 10-15%
         for candidate in candidates:
-            candidate["confidence_band"] = "low" if candidate["confidence_band"] in {"high", "medium"} else candidate["confidence_band"]
+            score = candidate["confidence_score"]
+            candidate["confidence_score"] = round(max(score - penalty, 0.0), 3)
+            # Recalculate band based on penalized score
+            candidate["confidence_band"] = _confidence_band(candidate["confidence_score"])
 
     return {
         "fixture_identity": fixture_identity,
