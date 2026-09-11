@@ -363,6 +363,29 @@ def _reload_fixtures_by_ids(db: Session, fixture_ids):
     )
 
 
+def _store_fixture_predictions(db: Session, fixtures: List[Fixture]) -> int:
+    """Regenerate stored model outputs for scheduled fixtures.
+
+    ``build_match_context`` deliberately supplies league priors for newly
+    discovered teams.  Do not discard those outputs just because the fixture
+    has not accumulated enough local history yet: they are low-confidence
+    forecasts, not automatically qualified betting recommendations.
+    """
+    prediction_engine = PredictionEngine(db)
+    predictions_created = 0
+
+    for fixture in fixtures:
+        db.query(Prediction).filter(Prediction.fixture_id == fixture.id).delete()
+        if fixture.status != "scheduled":
+            continue
+
+        for prediction in prediction_engine.predict_match(fixture):
+            db.add(prediction)
+            predictions_created += 1
+
+    return predictions_created
+
+
 def _parse_public_web_kickoff(requested_date: calendar_date, kickoff_time: Optional[str]) -> datetime:
     kickoff_dt, _ = _parse_public_web_kickoff_with_meta(requested_date, kickoff_time)
     return kickoff_dt
@@ -2095,7 +2118,18 @@ def _fixture_analyzability_diagnostic(db: Session, fixture: Fixture, enrichment:
     }
 
 
-def _ranked_predictions_for_fixture(db: Session, fixture: Fixture, min_edge: float = 0.0):
+def _ranked_predictions_for_fixture(
+    db: Session,
+    fixture: Fixture,
+    min_edge: float = 0.0,
+    include_unqualified: bool = False,
+):
+    """Rank stored forecasts, optionally retaining low-evidence model outputs.
+
+    The public match feed is a forecast feed and should show fallback forecasts
+    for newly collected fixtures.  Recommendation surfaces retain the default
+    behaviour and exclude unqualified picks.
+    """
     context = build_match_context(db, fixture)
     predictions = db.query(Prediction).filter(Prediction.fixture_id == fixture.id).all()
     ranked = []
@@ -2104,7 +2138,7 @@ def _ranked_predictions_for_fixture(db: Session, fixture: Fixture, min_edge: flo
         if prediction.edge < min_edge:
             continue
         details = _prediction_details(prediction, context)
-        if prediction.stake <= 0 and not details["qualified"]:
+        if not include_unqualified and prediction.stake <= 0 and not details["qualified"]:
             continue
         ranked.append((prediction, details))
 
@@ -3066,8 +3100,6 @@ def generate_predictions(
     db: Session = Depends(get_db),
 ):
     """Generate predictions for fixtures on the requested day."""
-    prediction_engine = PredictionEngine(db)
-    
     if fixture_id:
         fixtures = db.query(Fixture).filter(Fixture.id == fixture_id).all()
     else:
@@ -3082,20 +3114,7 @@ def generate_predictions(
             )
             .all()
         )
-    predictions_created = 0
-    
-    for fixture in fixtures:
-        db.query(Prediction).filter(Prediction.fixture_id == fixture.id).delete()
-        if fixture.status != "scheduled":
-            continue
-        context = build_match_context(db, fixture)
-        if context["data_quality"] < 0.42:
-            continue
-        predictions = prediction_engine.predict_match(fixture)
-        for pred in predictions:
-            db.add(pred)
-            predictions_created += 1
-    
+    predictions_created = _store_fixture_predictions(db, fixtures)
     db.commit()
     return {
         "message": f"Created {predictions_created} predictions",
@@ -3123,7 +3142,7 @@ def get_todays_predictions(
     
     results = []
     for fixture in fixtures:
-        ranked = _ranked_predictions_for_fixture(db, fixture)
+        ranked = _ranked_predictions_for_fixture(db, fixture, include_unqualified=True)
         if ranked:
             results.append(_serialize_match_predictions(fixture, [prediction for prediction, _ in ranked[:3]]))
     
@@ -3242,18 +3261,8 @@ def run_full_pipeline(
     results["stats_updated"] = refresh_team_statistics(db)
     
     # Step 3: Generate predictions
-    prediction_engine = PredictionEngine(db)
     fixtures_to_predict = [fixture for fixture in visible_fixtures if fixture.status == "scheduled"]
-    predictions_created = 0
-    for fixture in fixtures_to_predict:
-        db.query(Prediction).filter(Prediction.fixture_id == fixture.id).delete()
-        context = build_match_context(db, fixture)
-        if context["data_quality"] < 0.42:
-            continue
-        predictions = prediction_engine.predict_match(fixture)
-        for pred in predictions:
-            db.add(pred)
-            predictions_created += 1
+    predictions_created = _store_fixture_predictions(db, fixtures_to_predict)
     db.commit()
     results["predictions_created"] = predictions_created
     collection_summary = _day_collection_summary(
