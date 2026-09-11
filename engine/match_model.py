@@ -472,16 +472,16 @@ def calibrate_probability(market: str, selection: str, poisson_probability: floa
     prior = None
     if market == "BTTS":
         prior = context["empirical"]["btts"] if selection == "Yes" else 1 - context["empirical"]["btts"]
-    elif market == "Over1.5":
+    elif market in {"Over1.5", "Under1.5"}:
         prior = context["empirical"]["over15"] if selection == "Over" else 1 - context["empirical"]["over15"]
-    elif market == "Over2.5":
+    elif market in {"Over2.5", "Under2.5"}:
         prior = context["empirical"]["over25"] if selection == "Over" else 1 - context["empirical"]["over25"]
-    elif market == "Over3.5":
+    elif market in {"Over3.5", "Under3.5"}:
         prior = context["empirical"]["over35"] if selection == "Over" else 1 - context["empirical"]["over35"]
     elif market == "HomeGoals0.5":
-        prior = context["empirical"]["home_scoring"]
+        prior = context["empirical"]["home_scoring"] if selection == "Over" else 1 - context["empirical"]["home_scoring"]
     elif market == "AwayGoals0.5":
-        prior = context["empirical"]["away_scoring"]
+        prior = context["empirical"]["away_scoring"] if selection == "Over" else 1 - context["empirical"]["away_scoring"]
 
     if prior is None:
         return round(clamp(poisson_probability, 0.01, 0.99), 4)
