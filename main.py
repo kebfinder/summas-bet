@@ -15,7 +15,7 @@ from typing import Dict, List, Optional, Tuple
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.orm import Session
@@ -108,6 +108,7 @@ logger = logging.getLogger(__name__)
 
 APP_VERSION = "1.6.4"
 ARTIFACTS_DIR = Path("artifacts")
+FRONTEND_DIST_DIR = Path(__file__).resolve().parent / "frontend" / "dist"
 _MARKET_EVIDENCE_CACHE: Dict[Tuple[str, int], Dict[str, dict]] = {}
 _PUBLIC_WEB_BUNDLE_CACHE: Dict[str, tuple[float, dict]] = {}
 _PUBLIC_WEB_INFLIGHT: Dict[str, threading.Event] = {}
@@ -183,6 +184,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Football Prediction API", version=APP_VERSION, lifespan=lifespan)
 app.mount("/static", StaticFiles(directory="static"), name="static")
+if (FRONTEND_DIST_DIR / "assets").is_dir():
+    app.mount("/assets", StaticFiles(directory=FRONTEND_DIST_DIR / "assets"), name="frontend-assets")
 
 app.add_middleware(
     CORSMiddleware,
@@ -2730,6 +2733,10 @@ def _render_matchday_page(db: Session, match_date: Optional[calendar_date] = Non
 
 @app.get("/", response_class=HTMLResponse)
 def read_root(db: Session = Depends(get_db)):
+    """Serve the React application while retaining a safe server-rendered fallback."""
+    index_path = FRONTEND_DIST_DIR / "index.html"
+    if index_path.is_file():
+        return FileResponse(index_path)
     return HTMLResponse(_render_homepage(db))
 
 
