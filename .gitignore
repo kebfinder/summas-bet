@@ -5,3 +5,4 @@ __pycache__/
 venv/
 football.db
 predictions.log
+frontend/node_modules/
